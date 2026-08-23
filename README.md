@@ -16,7 +16,7 @@
 ## Installing
 
 Please visit our wiki for more information:
-[wiki](https://github.com/glcoin-network/gold-blockchain/wiki).
+[wiki](https://github.com/glcoin-network/gold_blockchain/wiki).
 
 Download [Gold blockchain database]
 

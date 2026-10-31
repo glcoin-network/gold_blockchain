@@ -1,0 +1,80 @@
+FROM gold-timelord-recovery:ubuntu20.04-amd64 AS rust
+
+FROM ubuntu:24.04 AS build
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_BUILD_JOBS=2 \
+    VIRTUAL_ENV=/opt/venv
+RUN apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    ca-certificates git build-essential cmake pkg-config \
+    python3.12 python3.12-dev python3.12-venv \
+    libgmp-dev libboost-python-dev libboost-system-dev libssl-dev libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:/usr/local/cargo/bin:${PATH}"
+RUN python -m pip install "pip==24.3.1" "setuptools==69.5.1" "wheel==0.45.1" "maturin==1.7.8"
+COPY gold_rs /opt/gold-native
+RUN maturin build --offline --release --locked \
+    --manifest-path /opt/gold-native/wheel/Cargo.toml \
+    --interpreter /opt/venv/bin/python --out /opt/wheels
+RUN python -m pip install /opt/wheels/gold_rs-0.9.0-*.whl
+COPY g-timelord/setup.py g-timelord/pyproject.toml g-timelord/README.md /opt/gold-src/
+COPY g-timelord/build_scripts/timelord-recovery/runtime-constraints-ubuntu24.04.txt /opt/gold-build-constraints.txt
+WORKDIR /opt/gold-src
+RUN --mount=type=cache,target=/root/.cache/pip \
+    PIP_CONSTRAINT=/opt/gold-build-constraints.txt python -m pip install .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    BUILD_VDF_BENCH=Y python -m pip install \
+    --force-reinstall --no-cache-dir --no-binary=chiavdf "chiavdf==1.1.4"
+COPY g-timelord /opt/gold-src
+RUN chmod 644 /opt/gold-src/mozilla-ca/cacert.pem \
+    && python -m pip install --no-deps --no-build-isolation --editable . \
+    && python -m pip check
+RUN --network=none GOLD_TEST_REAL_IMPORTS=1 python chia/_tests/timelord/test_peak_recovery.py
+RUN --network=none python build_scripts/timelord-recovery/smoke_test.py
+ARG VERIFIED_IMAGE_ID=unknown
+ARG GOLD_SOURCE_REVISION=unknown
+ARG GOLD_NATIVE_REVISION=unknown
+RUN python build_scripts/timelord-recovery/build_deb.py \
+    --source /opt/gold-src --output /out --version 2.0.3 \
+    --target-ubuntu 24.04 --include-ubuntu-in-filename --base-image-id "${VERIFIED_IMAGE_ID}" \
+    --source-revision "${GOLD_SOURCE_REVISION}" --native-revision "${GOLD_NATIVE_REVISION}"
+
+FROM ubuntu:24.04 AS verify
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH="/opt/gold/venv/bin:${PATH}" \
+    GOLD_ACCEPTANCE_SECONDS=480 \
+    GOLD_ROOT=/tmp/gold-runtime-smoke/mainnet \
+    GOLD_KEYS_ROOT=/tmp/gold-runtime-smoke/keys
+COPY --from=build /out /out
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends binutils \
+    && sha256sum /usr/bin/gold > /out/binutils-gold-before.sha256 \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    /out/gold-blockchain-cli_2.0.3_amd64_ubuntu24.04.deb \
+    && sha256sum -c /out/binutils-gold-before.sha256 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/gold/venv/lib/python3.12/site-packages
+COPY g-timelord/build_scripts/timelord-recovery/smoke_test.py /checks/smoke_test.py
+COPY g-timelord/build_scripts/timelord-recovery/docker_runtime_acceptance.py /checks/docker_runtime_acceptance.py
+COPY g-timelord/build_scripts/timelord-recovery/verify_deb_installation.py /checks/verify_deb_installation.py
+RUN gold version && dpkg-query -W gold-blockchain-cli && python -m pip check \
+    && test "$(dpkg-query -S /usr/bin/gold | cut -d: -f1)" = "binutils" \
+    && /usr/bin/gold --version \
+    && /usr/local/bin/gold version \
+    && test -x vdf_client && test -x vdf_bench
+RUN --network=none GOLD_TEST_REAL_IMPORTS=1 python chia/_tests/timelord/test_peak_recovery.py
+RUN --network=none python /checks/smoke_test.py \
+    && cp /opt/gold-image-verification.json /out/deb-vdf-verification.json
+LABEL gold.deb.version="2.0.3" \
+    gold.deb.filename="gold-blockchain-cli_2.0.3_amd64_ubuntu24.04.deb" \
+    gold.target.ubuntu="24.04" \
+    gold.timelord.included="true"
+CMD ["/bin/sh", "-c", "set -eu; python /checks/docker_runtime_acceptance.py; /opt/gold/venv/bin/python /checks/verify_deb_installation.py"]

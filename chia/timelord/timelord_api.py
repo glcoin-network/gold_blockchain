@@ -7,6 +7,7 @@ from typing import Optional
 
 from chia.protocols import timelord_protocol
 from chia.rpc.rpc_server import StateChangedProtocol
+from chia.server.ws_connection import WSGoldConnection
 from chia.timelord.iters_from_block import iters_from_block
 from chia.timelord.timelord import Timelord
 from chia.timelord.types import Chain, IterationType, StateType
@@ -30,14 +31,35 @@ class TimelordAPI:
     def _set_state_changed_callback(self, callback: StateChangedProtocol) -> None:
         self.timelord.state_changed_callback = callback
 
-    @api_request()
-    async def new_peak_timelord(self, new_peak: timelord_protocol.NewPeakTimelord) -> None:
+    @api_request(peer_required=True)
+    async def new_peak_timelord(
+        self, new_peak: timelord_protocol.NewPeakTimelord, peer: WSGoldConnection
+    ) -> None:
         if self.timelord.last_state is None:
             return None
         async with self.timelord.lock:
             if self.timelord.bluebox_mode:
                 return None
             self.timelord.max_allowed_inactivity_time = 60
+
+            if (
+                self.timelord.last_state.peak is not None
+                and self.timelord.last_state.peak.reward_chain_block == new_peak.reward_chain_block
+            ):
+                self.timelord.pending_peak_recovery = None
+                log.info("Skipping peak, already have.")
+                self.timelord.state_changed("skipping_peak", {"height": new_peak.reward_chain_block.height})
+                return None
+
+            pending = self.timelord.pending_peak_recovery
+            if pending is not None and new_peak.reward_chain_block.weight > pending[0].reward_chain_block.weight:
+                peak_hash = new_peak.reward_chain_block.get_hash()
+                if any(
+                    challenge == peak_hash
+                    and total_iters == new_peak.reward_chain_block.total_iters
+                    for challenge, total_iters in self.timelord.last_state.reward_challenge_cache
+                ):
+                    self.timelord.pending_peak_recovery = None
 
             # if there is a heavier unfinished block from a diff chain, skip
             if self.timelord.last_state.state_type == StateType.PEAK:
@@ -50,11 +72,13 @@ class TimelordAPI:
                                 break
 
                         if not found:
+                            self.timelord._queue_peak_recovery(new_peak, peer)
                             log.info(
                                 "there is a heavier unfinished block that does not belong to this chain- skip peak"
                             )
                             return None
 
+            self.timelord.pending_peak_recovery = None
             if new_peak.reward_chain_block.weight > self.timelord.last_state.get_weight():
                 log.info("Not skipping peak, don't have. Maybe we are not the fastest timelord")
                 log.info(
@@ -63,12 +87,6 @@ class TimelordAPI:
                 )
                 self.timelord.new_peak = new_peak
                 self.timelord.state_changed("new_peak", {"height": new_peak.reward_chain_block.height})
-            elif (
-                self.timelord.last_state.peak is not None
-                and self.timelord.last_state.peak.reward_chain_block == new_peak.reward_chain_block
-            ):
-                log.info("Skipping peak, already have.")
-                self.timelord.state_changed("skipping_peak", {"height": new_peak.reward_chain_block.height})
             else:
                 log.warning("block that we don't have, changing to it.")
                 self.timelord.new_peak = new_peak

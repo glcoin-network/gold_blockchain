@@ -1,0 +1,17 @@
+.git
+**/.git
+analysis
+artifacts
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.venv
+**/venv
+**/node_modules
+**/target
+**/dist
+**/*.log
+**/*.deb
+**/*.plot
+**/.gold
+**/.gold_keys

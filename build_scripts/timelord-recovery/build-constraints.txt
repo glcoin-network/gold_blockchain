@@ -1,0 +1,4 @@
+# Keep isolated puzzle builds on the same compatible libraries as the application.
+# chia-base 0.1.7 requires clvm-rs 0.2.5; setup.py pins clvm-tools-rs 0.1.40.
+clvm-rs==0.2.5
+clvm-tools-rs==0.1.40

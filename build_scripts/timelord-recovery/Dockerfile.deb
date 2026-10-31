@@ -1,0 +1,46 @@
+ARG VERIFIED_IMAGE=gold-timelord-recovery:ubuntu20.04-amd64
+FROM ${VERIFIED_IMAGE} AS package
+
+ARG VERIFIED_IMAGE_ID=unknown
+ARG GOLD_SOURCE_REVISION=unknown
+ARG GOLD_NATIVE_REVISION=unknown
+COPY g-timelord /build/gold-src
+RUN python /build/gold-src/build_scripts/timelord-recovery/build_deb.py \
+    --source /build/gold-src --output /out --version 2.0.3 \
+    --base-image-id "${VERIFIED_IMAGE_ID}" \
+    --source-revision "${GOLD_SOURCE_REVISION}" --native-revision "${GOLD_NATIVE_REVISION}"
+
+FROM ubuntu:20.04 AS verify
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH="/opt/gold/venv/bin:${PATH}"
+COPY --from=package /out /out
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    /out/gold-blockchain-cli_2.0.3_amd64.deb \
+    && rm -rf /var/lib/apt/lists/*
+RUN test "$(gold version)" = "2.0.3" \
+    && dpkg-query -W gold-blockchain-cli \
+    && /opt/gold/venv/bin/python -m pip check \
+    && test -x /opt/gold/venv/lib/python3.8/site-packages/vdf_client \
+    && test -x /opt/gold/venv/lib/python3.8/site-packages/vdf_bench
+WORKDIR /opt/gold/venv/lib/python3.8/site-packages
+RUN --network=none GOLD_TEST_REAL_IMPORTS=1 /opt/gold/venv/bin/python \
+    chia/_tests/timelord/test_peak_recovery.py
+COPY --from=package /build/gold-src/build_scripts/timelord-recovery/smoke_test.py /tmp/gold-checks/smoke_test.py
+COPY --from=package /build/gold-src/build_scripts/timelord-recovery/runtime_smoke_test.py /tmp/gold-checks/runtime_smoke_test.py
+RUN --network=none /opt/gold/venv/bin/python \
+    /tmp/gold-checks/smoke_test.py \
+    && cp /opt/gold-image-verification.json /out/deb-vdf-verification.json
+RUN --network=none GOLD_ROOT=/tmp/gold-runtime-smoke/mainnet \
+    GOLD_KEYS_ROOT=/tmp/gold-runtime-smoke/keys \
+    /opt/gold/venv/bin/python /tmp/gold-checks/runtime_smoke_test.py \
+    > /out/deb-runtime-smoke.txt 2>&1 \
+    || { cat /out/deb-runtime-smoke.txt; exit 1; }
+RUN cat /out/deb-runtime-smoke.txt \
+    && test "$(gold version)" = "2.0.3"
+LABEL gold.deb.version="2.0.3" \
+    gold.deb.filename="gold-blockchain-cli_2.0.3_amd64.deb" \
+    gold.timelord.included="true"
+ENTRYPOINT ["gold"]
+CMD ["--help"]

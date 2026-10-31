@@ -42,6 +42,7 @@ from chia.types.blockchain_format.vdf import VDFInfo, VDFProof, validate_vdf
 from chia.types.end_of_slot_bundle import EndOfSubSlotBundle
 from chia.util.config import process_config_start_method
 from chia.util.ints import uint8, uint16, uint32, uint64, uint128
+from chia.util.network import is_localhost
 from chia.util.setproctitle import getproctitle, setproctitle
 from chia.util.streamable import Streamable, streamable
 
@@ -71,6 +72,8 @@ def prove_bluebox_slow(payload: bytes) -> bytes:
 
 
 class Timelord:
+    PEAK_RECOVERY_TIMEOUT: ClassVar[float] = 15.0
+
     if TYPE_CHECKING:
         from chia.rpc.rpc_server import RpcServiceProtocol
 
@@ -105,6 +108,7 @@ class Timelord:
         self.allows_iters: List[Chain] = []
         # Last peak received, None if it's already processed.
         self.new_peak: Optional[timelord_protocol.NewPeakTimelord] = None
+        self.pending_peak_recovery: Optional[Tuple[timelord_protocol.NewPeakTimelord, WSGoldConnection, float]] = None
         # Last state received. Can either be a new peak or a new EndOfSubslotBundle.
         # Unfinished block info, iters adjusted to the last peak.
         self.unfinished_blocks: List[timelord_protocol.NewUnfinishedBlockTimelord] = []
@@ -847,6 +851,64 @@ class Timelord:
                     self.total_unfinished += 1
             await self._reset_chains()
 
+    def _queue_peak_recovery(self, peak: timelord_protocol.NewPeakTimelord, peer: WSGoldConnection) -> None:
+        # Only our outbound loopback full node can correct a speculative local infusion.
+        if (
+            peer.closed
+            or peer.connection_type != NodeType.FULL_NODE
+            or not peer.is_outbound
+            or not is_localhost(peer.peer_info.host)
+            or self.last_state.state_type != StateType.PEAK
+            or peak.reward_chain_block.height + 1 != self.last_state.get_height()
+            or peak.reward_chain_block.weight >= self.last_state.get_weight()
+        ):
+            return
+        peak_hash = peak.reward_chain_block.get_hash()
+        if not any(
+            challenge == peak_hash and total_iters == peak.reward_chain_block.total_iters
+            for challenge, total_iters in self.last_state.reward_challenge_cache
+        ):
+            return
+        pending = self.pending_peak_recovery
+        if pending is not None and pending[0].reward_chain_block == peak.reward_chain_block and not pending[1].closed:
+            self.pending_peak_recovery = (peak, peer, pending[2])
+            return
+        self.pending_peak_recovery = (peak, peer, time.monotonic())
+        log.warning(
+            f"Full node peak {peak.reward_chain_block.height} is behind a speculative infusion; "
+            f"will recover in {self.PEAK_RECOVERY_TIMEOUT} seconds unless a new peak is accepted"
+        )
+
+    def _check_for_peak_recovery(self) -> None:
+        pending = self.pending_peak_recovery
+        if pending is None:
+            return
+        peak, peer, started = pending
+        peak_hash = peak.reward_chain_block.get_hash()
+        if (
+            self.bluebox_mode
+            or peer.closed
+            or peak.reward_chain_block.total_iters >= self.last_state.get_total_iters()
+            or not any(
+                challenge == peak_hash
+                and total_iters == peak.reward_chain_block.total_iters
+                for challenge, total_iters in self.last_state.reward_challenge_cache
+            )
+        ):
+            self.pending_peak_recovery = None
+            return
+        if time.monotonic() - started < self.PEAK_RECOVERY_TIMEOUT:
+            return
+
+        log.warning(
+            f"Recovering speculative timelord state to local full node peak {peak.reward_chain_block.height}; "
+            f"discarding {len(self.unfinished_blocks)} unfinished and {len(self.overflow_blocks)} overflow blocks"
+        )
+        self.unfinished_blocks.clear()
+        self.overflow_blocks.clear()
+        self.pending_peak_recovery = None
+        self.new_peak = peak
+
     async def _handle_failures(self) -> None:
         if len(self.vdf_failures) > 0:
             # This can happen if one of the VDF processes has an issue. In this case, we abort all other
@@ -887,6 +949,7 @@ class Timelord:
                 await asyncio.sleep(0.1)
                 async with self.lock:
                     await self._handle_failures()
+                    self._check_for_peak_recovery()
                     # We've got a new peak, process it.
                     if self.new_peak is not None:
                         await self._handle_new_peak()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -28,6 +29,7 @@ def load_source_methods():
         "logging": logging,
         "log": logging.getLogger("peak_recovery_test"),
         "Decimal": Decimal,
+        "dataclasses": dataclasses,
         "uint8": int,
         "uint64": int,
     }
@@ -114,8 +116,14 @@ class Block:
         return self
 
 
+@dataclass(frozen=True)
+class Peak:
+    reward_chain_block: Block
+    previous_reward_challenges: list
+
+
 def peak(block):
-    return SimpleNamespace(reward_chain_block=block, previous_reward_challenges=[("ancestor", 100_000)])
+    return Peak(reward_chain_block=block, previous_reward_challenges=[("ancestor", 100_000)])
 
 
 class PeakRecoveryTest(unittest.IsolatedAsyncioTestCase):
@@ -147,6 +155,8 @@ class PeakRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.timelord.lock = asyncio.Lock()
         self.timelord.bluebox_mode = False
         self.timelord.pending_peak_recovery = None
+        self.timelord.pending_local_infusion = None
+        self.timelord.confirmed_local_peak = None
         self.timelord.new_peak = None
         self.timelord.max_allowed_inactivity_time = 60
         self.timelord.unfinished_blocks = [

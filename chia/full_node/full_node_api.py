@@ -951,8 +951,9 @@ class FullNodeAPI:
                     assert request.pool_target is not None
                     pool_target = request.pool_target
 
+                # Match the parent context used to validate this unfinished header.
                 difficulty_coeff = await self.full_node.blockchain.get_farmer_difficulty_coeff(
-                    request.proof_of_space.farmer_public_key
+                    request.proof_of_space.farmer_public_key, prev_b.height
                 )
 
             if peak is None or peak.height <= self.full_node.constants.MAX_SUB_SLOT_BLOCKS:
@@ -1022,6 +1023,7 @@ class FullNodeAPI:
             height = uint32(0) if prev_b is None else uint32(prev_b.height + 1)
             self.log.debug(f"[debug] creating block {height} {difficulty_coeff}")
             self.full_node.full_node_store.add_candidate_block(quality_string, height, unfinished_block)
+            self.full_node.full_node_store.candidate_signing_peers[quality_string] = peer.peer_node_id
 
             foliage_sb_data_hash = unfinished_block.foliage.foliage_block_data.get_hash()
             if unfinished_block.is_transaction_block():
@@ -1096,6 +1098,12 @@ class FullNodeAPI:
 
         if candidate_tuple is None:
             self.log.warning(f"Quality string {farmer_request.quality_string} not found in database")
+            return None
+        if await self.full_node.refresh_candidate_block(farmer_request.quality_string):
+            return None
+        # A peak refresh can replace the candidate while we wait for its lock.
+        candidate_tuple = self.full_node.full_node_store.get_candidate_block(farmer_request.quality_string)
+        if candidate_tuple is None:
             return None
         height, candidate = candidate_tuple
 

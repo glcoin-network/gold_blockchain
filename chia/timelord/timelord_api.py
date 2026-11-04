@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from decimal import Decimal
@@ -8,11 +9,13 @@ from typing import Optional
 from chia.protocols import timelord_protocol
 from chia.rpc.rpc_server import StateChangedProtocol
 from chia.server.ws_connection import WSGoldConnection
+from chia.server.outbound_message import NodeType
 from chia.timelord.iters_from_block import iters_from_block
 from chia.timelord.timelord import Timelord
 from chia.timelord.types import Chain, IterationType, StateType
 from chia.util.api_decorators import api_request
 from chia.util.ints import uint64
+from chia.util.network import is_localhost
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +34,15 @@ class TimelordAPI:
     def _set_state_changed_callback(self, callback: StateChangedProtocol) -> None:
         self.timelord.state_changed_callback = callback
 
+    @staticmethod
+    def _is_local_full_node(peer: WSGoldConnection) -> bool:
+        return (
+            not peer.closed
+            and peer.is_outbound
+            and peer.connection_type == NodeType.FULL_NODE
+            and is_localhost(peer.peer_info.host)
+        )
+
     @api_request(peer_required=True)
     async def new_peak_timelord(
         self, new_peak: timelord_protocol.NewPeakTimelord, peer: WSGoldConnection
@@ -41,11 +53,18 @@ class TimelordAPI:
             if self.timelord.bluebox_mode:
                 return None
             self.timelord.max_allowed_inactivity_time = 60
+            local_context = self._is_local_full_node(peer)
 
             if (
                 self.timelord.last_state.peak is not None
                 and self.timelord.last_state.peak.reward_chain_block == new_peak.reward_chain_block
             ):
+                if local_context:
+                    self.timelord.pending_local_infusion = None
+                    self.timelord.confirmed_local_peak = (
+                        dataclasses.replace(new_peak, previous_reward_challenges=list(new_peak.previous_reward_challenges)),
+                        peer,
+                    )
                 self.timelord.pending_peak_recovery = None
                 log.info("Skipping peak, already have.")
                 self.timelord.state_changed("skipping_peak", {"height": new_peak.reward_chain_block.height})
@@ -79,6 +98,12 @@ class TimelordAPI:
                             return None
 
             self.timelord.pending_peak_recovery = None
+            if local_context:
+                self.timelord.pending_local_infusion = None
+                self.timelord.confirmed_local_peak = (
+                    dataclasses.replace(new_peak, previous_reward_challenges=list(new_peak.previous_reward_challenges)),
+                    peer,
+                )
             if new_peak.reward_chain_block.weight > self.timelord.last_state.get_weight():
                 log.info("Not skipping peak, don't have. Maybe we are not the fastest timelord")
                 log.info(
@@ -92,14 +117,65 @@ class TimelordAPI:
                 self.timelord.new_peak = new_peak
                 self.timelord.state_changed("new_peak", {"height": new_peak.reward_chain_block.height})
 
-    @api_request()
-    async def new_unfinished_block_timelord(self, new_unfinished_block: timelord_protocol.NewUnfinishedBlockTimelord):
+    @api_request(peer_required=True)
+    async def new_unfinished_block_timelord(
+        self, new_unfinished_block: timelord_protocol.NewUnfinishedBlockTimelord, peer: WSGoldConnection
+    ):
         if self.timelord.last_state is None:
             return None
         async with self.timelord.lock:
             if self.timelord.bluebox_mode:
                 return None
+            reward_hash = new_unfinished_block.reward_chain_block.get_hash()
+            local_context = self._is_local_full_node(peer)
             try:
+                coefficient = Decimal(new_unfinished_block.difficulty_coeff)
+                if not coefficient.is_finite() or coefficient <= 0:
+                    return None
+                if local_context:
+                    self.timelord.candidate_coefficients.put(reward_hash, new_unfinished_block.difficulty_coeff)
+                else:
+                    current = self.timelord.candidate_coefficients.get(reward_hash)
+                    if current is not None:
+                        new_unfinished_block = dataclasses.replace(new_unfinished_block, difficulty_coeff=current)
+                existing = [
+                    block for block in self.timelord.unfinished_blocks + self.timelord.overflow_blocks
+                    if block.reward_chain_block.get_hash() == reward_hash
+                ]
+                if existing:
+                    if all(block.difficulty_coeff == new_unfinished_block.difficulty_coeff for block in existing):
+                        return None
+                    previous = existing[0]
+                    try:
+                        _, old_ip = iters_from_block(
+                            self.timelord.constants, previous.reward_chain_block, previous.sub_slot_iters,
+                            previous.difficulty, self.timelord.get_height(), Decimal(previous.difficulty_coeff),
+                        )
+                        _, new_ip = iters_from_block(
+                            self.timelord.constants, previous.reward_chain_block, previous.sub_slot_iters,
+                            previous.difficulty, self.timelord.get_height(), Decimal(new_unfinished_block.difficulty_coeff),
+                        )
+                        same_iterations = old_ip == new_ip
+                    except ValueError:
+                        same_iterations = False
+                    if same_iterations:
+                        # Keep completed work when the coefficient rounds to the
+                        # same IP, independently of the current slot's origin.
+                        for pending in (self.timelord.unfinished_blocks, self.timelord.overflow_blocks):
+                            for index, block in enumerate(pending):
+                                if block.reward_chain_block.get_hash() == reward_hash:
+                                    pending[index] = dataclasses.replace(
+                                        block, difficulty_coeff=new_unfinished_block.difficulty_coeff
+                                    )
+                        return None
+                    self.timelord._retire_candidate(reward_hash)
+                    log.warning(
+                        "Retired stale candidate %s after stake coefficient update: %s -> %s; "
+                        "signed total iters %s no longer match the infusion context",
+                        reward_hash.hex(), previous.difficulty_coeff, new_unfinished_block.difficulty_coeff,
+                        previous.reward_chain_block.total_iters,
+                    )
+                    return None
                 sp_iters, ip_iters = iters_from_block(
                     self.timelord.constants,
                     new_unfinished_block.reward_chain_block,
@@ -108,7 +184,8 @@ class TimelordAPI:
                     self.timelord.get_height(),
                     Decimal(new_unfinished_block.difficulty_coeff),
                 )
-            except Exception:
+            except Exception as error:
+                log.warning("Cannot schedule candidate %s: invalid iteration context: %s", reward_hash.hex(), error)
                 return None
             last_ip_iters = self.timelord.last_state.get_last_ip()
             if sp_iters > ip_iters:

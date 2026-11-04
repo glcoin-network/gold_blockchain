@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 
 
-PACKAGE = Path("/out/gold-blockchain-cli_2.0.3_amd64_ubuntu24.04.deb")
+PACKAGE = Path("/out/gold-blockchain-cli_2.0.5_amd64.deb")
 TEST_DATA = Path("/tmp/gold-runtime-smoke")
 SITE = Path(sysconfig.get_paths()["purelib"])
 
@@ -32,8 +32,8 @@ def snapshot():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--package", type=Path, default=PACKAGE)
-    parser.add_argument("--package-version", default="2.0.3")
-    parser.add_argument("--cli-version", default="2.0.3")
+    parser.add_argument("--package-version", default="2.0.5")
+    parser.add_argument("--cli-version", default="2.0.5")
     args = parser.parse_args()
     package = args.package
     metadata = {
@@ -89,12 +89,23 @@ def main():
         "from importlib.metadata import version; print(version('gold-blockchain'))",
     )
     assert distribution_version == args.cli_version
+    build_info = json.loads(Path("/opt/gold/BUILD-INFO.json").read_text())
+    assert build_info["version"] == args.package_version
+    assert build_info["cli_version"] == args.cli_version
+    for name, expected in build_info["source_sha256"].items():
+        assert hashlib.sha256((SITE / name).read_bytes()).hexdigest() == expected, name
+    for name in ("vdf_client", "vdf_bench"):
+        assert hashlib.sha256((SITE / name).read_bytes()).hexdigest() == build_info[f"{name}_sha256"], name
     assert run(
         "/usr/bin/env", "PATH=/usr/local/bin:/usr/bin:/bin", "gold", "version"
     ) == version_before
     before = snapshot()
     assert "mainnet/config/config.yaml" in before
     assert any(name.startswith("keys/") for name in before)
+    overwrite = run("dpkg", "--install", package)
+    assert snapshot() == before, "Installing over the existing deb modified disposable node data"
+    assert hashlib.sha256(linker.read_bytes()).hexdigest() == linker_hash
+    assert run("/usr/local/bin/gold", "version") == version_before
     removal = run("dpkg", "--remove", "gold-blockchain-cli")
     assert snapshot() == before, "Removing the deb modified disposable node data"
     assert hashlib.sha256(linker.read_bytes()).hexdigest() == linker_hash
@@ -117,11 +128,15 @@ def main():
         "native_dynamic_libraries": dynamic_links,
         "no_packaged_home_or_node_data": True,
         "disposable_data_files_preserved": len(before),
+        "install_over_existing_package_preserves_data": True,
+        "overwrite_installation_output": overwrite,
         "remove_and_reinstall": True,
         "removal_output": removal,
         "reinstall_output": reinstall,
         "cli_version": version_before,
         "python_distribution_version": distribution_version,
+        "installed_source_hashes_match_build_info": True,
+        "installed_native_hashes_match_build_info": True,
         "cli_path": "/usr/local/bin/gold",
         "system_gold_owner": system_gold_owner,
         "system_linker_sha256_preserved": linker_hash,

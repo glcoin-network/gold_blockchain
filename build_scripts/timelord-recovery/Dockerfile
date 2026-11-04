@@ -44,6 +44,8 @@ RUN chmod 644 /opt/gold-src/mozilla-ca/cacert.pem
 RUN python -m pip install --no-deps --no-build-isolation --editable .
 RUN python -m pip check
 RUN GOLD_TEST_REAL_IMPORTS=1 python chia/_tests/timelord/test_peak_recovery.py
+RUN --network=none python chia/_tests/timelord/test_iteration_consistency.py
+RUN --network=none GOLD_TEST_REAL_IMPORTS=1 python -m unittest chia._tests.timelord.test_candidate_refresh
 RUN python build_scripts/timelord-recovery/smoke_test.py
 
 ARG GOLD_SOURCE_REVISION=unknown

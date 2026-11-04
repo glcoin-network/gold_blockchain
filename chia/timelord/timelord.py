@@ -42,6 +42,7 @@ from chia.types.blockchain_format.vdf import VDFInfo, VDFProof, validate_vdf
 from chia.types.end_of_slot_bundle import EndOfSubSlotBundle
 from chia.util.config import process_config_start_method
 from chia.util.ints import uint8, uint16, uint32, uint64, uint128
+from chia.util.lru_cache import LRUCache
 from chia.util.network import is_localhost
 from chia.util.setproctitle import getproctitle, setproctitle
 from chia.util.streamable import Streamable, streamable
@@ -112,6 +113,11 @@ class Timelord:
         # Last state received. Can either be a new peak or a new EndOfSubslotBundle.
         # Unfinished block info, iters adjusted to the last peak.
         self.unfinished_blocks: List[timelord_protocol.NewUnfinishedBlockTimelord] = []
+        self.candidate_coefficients: LRUCache[bytes32, str] = LRUCache(1000)
+        self.confirmed_local_peak: Optional[Tuple[timelord_protocol.NewPeakTimelord, WSGoldConnection]] = None
+        self.pending_local_infusion: Optional[
+            Tuple[timelord_protocol.NewPeakTimelord, WSGoldConnection, float]
+        ] = None
         # Signage points iters, adjusted to the last peak.
         self.signage_point_iters: List[Tuple[uint64, uint8]] = []
         # For each chain, send those info when the process spawns.
@@ -261,6 +267,20 @@ class Timelord:
         except Exception as e:
             log.warning(f"Received invalid unfinished block: {e}.")
             return None
+        block_ip_total_iters = self.last_state.get_total_iters() - ip_iters + block_ip_iters
+        if block_ip_total_iters != rc_block.total_iters:
+            if (
+                is_overflow_block(self.constants, rc_block.signage_point_index)
+                and block_ip_total_iters + sub_slot_iters == rc_block.total_iters
+            ):
+                return None  # Keep future overflow work pending until the next sub-slot.
+            log.warning(
+                "Will not infuse unfinished block %s: total iters mismatch, expected %s got %s; "
+                "height %s, difficulty %s, coefficient %s, sub slot iters %s",
+                rc_block.get_hash().hex(), block_ip_total_iters, rc_block.total_iters,
+                self.get_height(), difficulty, block.difficulty_coeff, sub_slot_iters,
+            )
+            return None
         block_sp_total_iters = self.last_state.total_iters - ip_iters + block_sp_iters
         if is_overflow_block(self.constants, block.reward_chain_block.signage_point_index):
             block_sp_total_iters -= self.last_state.get_sub_slot_iters()
@@ -295,6 +315,14 @@ class Timelord:
         if new_block_iters > 0:
             return new_block_iters
         return None
+
+    def _retire_candidate(self, reward_hash: bytes32) -> None:
+        self.unfinished_blocks = [
+            block for block in self.unfinished_blocks if block.reward_chain_block.get_hash() != reward_hash
+        ]
+        self.overflow_blocks = [
+            block for block in self.overflow_blocks if block.reward_chain_block.get_hash() != reward_hash
+        ]
 
     async def _reset_chains(self, *, first_run: bool = False, only_eos: bool = False) -> None:
         # First, stop all chains.
@@ -526,7 +554,9 @@ class Timelord:
             self.signage_point_iters.remove(r)
 
     async def _check_for_new_ip(self, iter_to_look_for: uint64) -> None:
-        if len(self.unfinished_blocks) == 0:
+        if self.pending_local_infusion is not None:
+            # VDF work can continue, but its parent must be confirmed before
+            # another candidate is infused with a height-dependent coefficient.
             return
         infusion_iters = [
             iteration for iteration, t in self.iteration_to_proof_type.items() if t == IterationType.INFUSION_POINT
@@ -560,10 +590,24 @@ class Timelord:
                         log.error(f"Error {e}")
                         continue
                     if ip_iters - self.last_state.get_last_ip() == iteration:
+                        ip_total_iters = self.last_state.get_total_iters() + iteration
+                        if ip_total_iters != unfinished_block.reward_chain_block.total_iters:
+                            log.warning(
+                                "Discarding infusion for unfinished block %s: total iters mismatch, "
+                                "expected %s got %s",
+                                unfinished_block.reward_chain_block.get_hash().hex(),
+                                ip_total_iters, unfinished_block.reward_chain_block.total_iters,
+                            )
+                            continue
                         block = unfinished_block
                         break
-                assert ip_iters is not None
+                if block is None:
+                    # Retire completed work so an unusable candidate cannot block later SPs or EOS.
+                    self.iters_finished.add(iter_to_look_for)
+                    self.proofs_finished = self._clear_proof_list(iteration)
+                    continue
                 if block is not None:
+                    assert ip_iters is not None
                     ip_total_iters = self.last_state.get_total_iters() + iteration
                     challenge = block.reward_chain_block.get_hash()
                     icc_info: Optional[VDFInfo] = None
@@ -719,6 +763,9 @@ class Timelord:
                         uint128(last_csb_or_eos),
                         passed_ses_height_but_not_yet_included,
                     )
+                    if self.confirmed_local_peak is not None:
+                        confirmed_peak, confirmed_peer = self.confirmed_local_peak
+                        self.pending_local_infusion = (confirmed_peak, confirmed_peer, time.monotonic())
 
                     await self._handle_new_peak()
                     # Break so we alternate between checking SP and IP
@@ -880,6 +927,28 @@ class Timelord:
         )
 
     def _check_for_peak_recovery(self) -> None:
+        confirmation = self.pending_local_infusion
+        if confirmation is not None:
+            confirmed_peak, confirmed_peer, started = confirmation
+            if confirmed_peer.closed or time.monotonic() - started >= self.PEAK_RECOVERY_TIMEOUT:
+                log.warning(
+                    "Local full node has not confirmed the speculative infusion%s; "
+                    "recovering to confirmed peak %s and discarding %s unfinished and %s overflow blocks",
+                    " (connection closed)" if confirmed_peer.closed else " before the confirmation timeout",
+                    confirmed_peak.reward_chain_block.height,
+                    len(self.unfinished_blocks), len(self.overflow_blocks),
+                )
+                self.unfinished_blocks.clear()
+                self.overflow_blocks.clear()
+                self.pending_local_infusion = None
+                self.pending_peak_recovery = None
+                self.new_peak = dataclasses.replace(
+                    confirmed_peak, previous_reward_challenges=list(confirmed_peak.previous_reward_challenges)
+                )
+                if confirmed_peer.closed:
+                    self.confirmed_local_peak = None
+                    self.candidate_coefficients = LRUCache(1000)
+                return
         pending = self.pending_peak_recovery
         if pending is None:
             return
@@ -907,6 +976,7 @@ class Timelord:
         self.unfinished_blocks.clear()
         self.overflow_blocks.clear()
         self.pending_peak_recovery = None
+        self.pending_local_infusion = None
         self.new_peak = peak
 
     async def _handle_failures(self) -> None:
@@ -1123,11 +1193,28 @@ class Timelord:
                     self.bluebox_mode,
                 )
 
-                if not validate_vdf(vdf_proof, self.constants, initial_form, vdf_info):
+                proof_is_valid = validate_vdf(vdf_proof, self.constants, initial_form, vdf_info)
+                if not proof_is_valid:
                     log.error("Invalid proof of time!")
                 if not self.bluebox_mode:
                     async with self.lock:
                         assert proof_label is not None
+                        if (
+                            proof_is_valid
+                            and proof_label == self.num_resets
+                            and challenge == self.last_state.get_challenge(chain)
+                            and iterations_needed in self.iters_submitted.get(chain, [])
+                            and iterations_needed not in self.iters_finished
+                            and not any(
+                                pending_chain == chain
+                                and pending_info.number_of_iterations == iterations_needed
+                                and pending_label == proof_label
+                                for pending_chain, pending_info, _, pending_label in self.proofs_finished
+                            )
+                        ):
+                            # One chain can finish before its partner. A new,
+                            # validated requested proof is evidence of activity.
+                            self.last_active_time = time.time()
                         self.proofs_finished.append((chain, vdf_info, vdf_proof, proof_label))
                     self.state_changed(
                         "finished_pot",

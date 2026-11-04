@@ -91,6 +91,7 @@ class FullNodeStore:
     # Blocks which we have created, but don't have plot signatures yet, so not yet "unfinished blocks"
     candidate_blocks: Dict[bytes32, Tuple[uint32, UnfinishedBlock]]
     candidate_backup_blocks: Dict[bytes32, Tuple[uint32, UnfinishedBlock]]
+    candidate_signing_peers: Dict[bytes32, bytes32]
 
     # Block hashes of unfinished blocks that we have seen recently. This is
     # effectively a Set[bytes32] but in order to evict the oldest items first,
@@ -147,6 +148,7 @@ class FullNodeStore:
     def __init__(self, constants: ConsensusConstants):
         self.candidate_blocks = {}
         self.candidate_backup_blocks = {}
+        self.candidate_signing_peers = {}
         self.seen_unfinished_blocks = {}
         self._unfinished_blocks = {}
         self.finished_sub_slots = []
@@ -227,6 +229,7 @@ class FullNodeStore:
             if value[0] < height:
                 del_keys.append(key)
         for key in del_keys:
+            self.candidate_signing_peers.pop(key, None)
             try:
                 del self.candidate_blocks[key]
             except KeyError:
@@ -309,7 +312,7 @@ class FullNodeStore:
     # we only have PreValidationResults for transaction blocks, and they all
     # have a foliage hash. That's why unfinished_foliage_hash is not Optional.
     def get_unfinished_block_result(
-        self, unfinished_reward_hash: bytes32, unfinished_foliage_hash: bytes32
+        self, unfinished_reward_hash: bytes32, unfinished_foliage_hash: Optional[bytes32]
     ) -> Optional[UnfinishedBlockEntry]:
         result = self._unfinished_blocks.get(unfinished_reward_hash, None)
         if result is None:
@@ -325,6 +328,14 @@ class FullNodeStore:
                 if ube.height == height and ube.unfinished_block is not None:
                     ret.append(ube.unfinished_block)
         return ret
+
+    def get_pending_unfinished_blocks(self, total_iters: uint128) -> List[UnfinishedBlock]:
+        pending = []
+        for entries in self._unfinished_blocks.values():
+            _, block = find_best_block(entries)
+            if block is not None and block.total_iters > total_iters:
+                pending.append(block)
+        return pending
 
     def clear_unfinished_blocks_below(self, height: uint32) -> None:
         del_partial: List[bytes32] = []

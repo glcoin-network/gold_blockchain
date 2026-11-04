@@ -54,6 +54,24 @@ def log(message):
     print(message, flush=True)
 
 
+def unexpected_runtime_errors(records, stop_windows):
+    windows = [
+        (datetime.fromisoformat(window["started_at_utc"]), datetime.fromisoformat(window["finished_at_utc"]))
+        for window in stop_windows if "finished_at_utc" in window
+    ]
+    unexpected = []
+    for line in records:
+        match = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d+) ", line)
+        stamp = None if match is None else datetime.fromisoformat(match[1]).replace(tzinfo=timezone.utc)
+        in_stop_window = stamp is not None and any(start <= stamp <= finish for start, finish in windows)
+        if not (
+            in_stop_window and "chia.timelord.timelord_launcher" in line
+            and "connect: Connection refused" in line
+        ):
+            unexpected.append(line)
+    return unexpected
+
+
 def keyring_hashes():
     return {
         str(path.relative_to(DEFAULT_KEYS_ROOT_PATH)): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -277,6 +295,9 @@ async def run_acceptance(result):
     result["error_log_records"] = [
         line for line in text.splitlines() if re.search(r":\s+ERROR(?:\s|$)", line)
     ]
+    result["unexpected_error_log_records"] = unexpected_runtime_errors(
+        result["error_log_records"], result.get("service_stop_windows_utc", [])
+    )
     failures = [
         line for line in text.splitlines()
         if any(pattern in line for pattern in (
@@ -292,6 +313,7 @@ async def run_acceptance(result):
             "unaligned tcache", "UNPROTECTED SSL FILE",
         ))
     )
+    failures.extend(result["unexpected_error_log_records"])
     result["critical_log_records"] = failures
     assert not failures, failures
 

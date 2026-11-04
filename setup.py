@@ -78,7 +78,7 @@ legacy_keyring_dependencies = [
 
 kwargs = dict(
     name="gold-blockchain",
-    version="2.0.3",
+    version="2.0.5",
     author="Mariano Sorgente",
     author_email="mariano@glcoin.net",
     description="Gold blockchain full node, farmer, timelord, and wallet.",

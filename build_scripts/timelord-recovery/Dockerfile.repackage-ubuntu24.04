@@ -1,0 +1,39 @@
+ARG VERIFIED_RUNTIME=gold-timelord-deb-verified:2.1-2-ubuntu24.04-amd64
+FROM ${VERIFIED_RUNTIME} AS package
+ARG VERIFIED_IMAGE_ID=unknown
+ARG GOLD_SOURCE_REVISION=unknown
+ARG GOLD_NATIVE_REVISION=unknown
+RUN ln -s /opt/gold/venv /opt/venv
+COPY setup.py pyproject.toml README.md LICENSE /build/gold-src/
+COPY chia /build/gold-src/chia
+COPY mozilla-ca /build/gold-src/mozilla-ca
+COPY build_scripts/__init__.py /build/gold-src/build_scripts/__init__.py
+COPY build_scripts/assets/systemd /build/gold-src/build_scripts/assets/systemd
+COPY build_scripts/timelord-recovery /build/gold-src/build_scripts/timelord-recovery
+RUN --network=none /opt/venv/bin/python /build/gold-src/build_scripts/timelord-recovery/build_deb.py \
+    --source /build/gold-src --output /release-out --version 2.0.5 \
+    --target-ubuntu 24.04 --base-image-id "${VERIFIED_IMAGE_ID}" \
+    --source-revision "${GOLD_SOURCE_REVISION}" --native-revision "${GOLD_NATIVE_REVISION}"
+
+FROM ${VERIFIED_RUNTIME} AS verify
+COPY --from=package /release-out /out
+COPY build_scripts/timelord-recovery/smoke_test.py /checks/smoke_test.py
+COPY build_scripts/timelord-recovery/docker_runtime_acceptance.py /checks/docker_runtime_acceptance.py
+COPY build_scripts/timelord-recovery/verify_deb_installation.py /checks/verify_deb_installation.py
+RUN --network=none sha256sum /usr/bin/gold > /out/binutils-gold-before.sha256 \
+    && dpkg --install /out/gold-blockchain-cli_2.0.5_amd64.deb \
+    && sha256sum -c /out/binutils-gold-before.sha256 \
+    && test "$(gold version)" = "2.0.5" \
+    && test "$(dpkg-query -W -f='${Version}' gold-blockchain-cli)" = "2.0.5" \
+    && python -m pip check
+WORKDIR /opt/gold/venv/lib/python3.12/site-packages
+RUN --network=none GOLD_TEST_REAL_IMPORTS=1 python chia/_tests/timelord/test_peak_recovery.py
+RUN --network=none python chia/_tests/timelord/test_iteration_consistency.py
+RUN --network=none GOLD_TEST_REAL_IMPORTS=1 python -m unittest chia._tests.timelord.test_candidate_refresh
+RUN --network=none python /checks/smoke_test.py \
+    && cp /opt/gold-image-verification.json /out/deb-vdf-verification.json
+LABEL gold.deb.version="2.0.5" \
+    gold.deb.filename="gold-blockchain-cli_2.0.5_amd64.deb" \
+    gold.target.ubuntu="24.04" \
+    gold.timelord.included="true"
+CMD ["/bin/sh", "-c", "set -eu; python /checks/docker_runtime_acceptance.py; python /checks/verify_deb_installation.py"]

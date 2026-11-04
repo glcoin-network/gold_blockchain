@@ -93,9 +93,10 @@ def copy_runtime(source, stage, wheel, python_version):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / "mozilla-ca" / filename, target)
         target.chmod(0o644)
-    test = Path("chia/_tests/timelord/test_peak_recovery.py")
-    (site / test).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source / test, site / test)
+    for name in ("test_peak_recovery.py", "test_iteration_consistency.py", "test_candidate_refresh.py"):
+        test = Path("chia/_tests/timelord") / name
+        (site / test).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source / test, site / test)
     for path in (runtime / "bin").iterdir():
         if not path.name.startswith("gold") or not path.is_file():
             continue
@@ -149,8 +150,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--version", default="2.0.3")
-    parser.add_argument("--revision", help="Optional numeric Debian revision; omit for a version such as 2.0.3")
+    parser.add_argument("--version", default="2.0.5")
+    parser.add_argument("--revision", help="Optional numeric Debian revision; omit for a version such as 2.0.5")
     parser.add_argument("--base-image-id", required=True)
     parser.add_argument("--source-revision", default="unknown")
     parser.add_argument("--native-revision", default="unknown")
@@ -201,9 +202,21 @@ def main():
             "recovery_timeout_seconds": 15,
             "source_sha256": {
                 name: hashlib.sha256((site / name).read_bytes()).hexdigest()
-                for name in ("chia/timelord/timelord.py", "chia/timelord/timelord_api.py")
+                for name in (
+                    "chia/timelord/timelord.py",
+                    "chia/timelord/timelord_api.py",
+                    "chia/full_node/full_node.py",
+                    "chia/full_node/full_node_api.py",
+                    "chia/full_node/full_node_store.py",
+                    "chia/full_node/candidate_refresh.py",
+                    "chia/consensus/multiprocess_validation.py",
+                    "chia/_tests/timelord/test_peak_recovery.py",
+                    "chia/_tests/timelord/test_iteration_consistency.py",
+                    "chia/_tests/timelord/test_candidate_refresh.py",
+                )
             },
             "vdf_client_sha256": hashlib.sha256((site / "vdf_client").read_bytes()).hexdigest(),
+            "vdf_bench_sha256": hashlib.sha256((site / "vdf_bench").read_bytes()).hexdigest(),
         }
         write_file(stage / "opt/gold/BUILD-INFO.json", json.dumps(provenance, indent=2) + "\n")
         docs = stage / "usr/share/doc/gold-blockchain-cli"

@@ -119,6 +119,15 @@ def batch_pre_validate_blocks(
             error_int: Optional[uint16] = None
             if error is not None:
                 error_int = uint16(error.code.value)
+                if error.code == Err.INVALID_TOTAL_ITERS:
+                    log.warning(
+                        "Block iteration validation failed: height %s, header %s, parent %s, "
+                        "farmer %s, difficulty %s, coefficient %s, sub slot iters %s, SP %s: %s",
+                        block.height, block.header_hash.hex(), block.prev_header_hash.hex(),
+                        bytes(block.reward_chain_block.proof_of_space.farmer_public_key).hex(),
+                        expected_difficulty[i], difficulty_coeffs[i], expected_sub_slot_iters[i],
+                        block.reward_chain_block.signage_point_index, error.error_msg,
+                    )
 
             successfully_validated_signatures = False
             # If we failed CLVM, no need to validate signature, the block is already invalid

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+from decimal import Decimal
 import logging
 import multiprocessing
 import random
@@ -45,6 +46,7 @@ from chia.consensus.multiprocess_validation import PreValidationResult
 from chia.consensus.pot_iterations import calculate_sp_iters
 from chia.full_node.block_store import BlockStore
 from chia.full_node.bundle_tools import detect_potential_template_generator
+from chia.full_node.candidate_refresh import refresh_candidate_iterations
 from chia.full_node.coin_store import CoinStore
 from chia.full_node.full_node_api import FullNodeAPI
 from chia.full_node.full_node_store import FullNodeStore, FullNodeStorePeakResult, UnfinishedBlockEntry
@@ -154,6 +156,8 @@ class FullNode:
     _transaction_queue_task: Optional[asyncio.Task[None]] = None
     simulator_transaction_callback: Optional[Callable[[bytes32], Awaitable[None]]] = None
     _sync_task: Optional[asyncio.Task[None]] = None
+    _candidate_refresh_task: Optional[asyncio.Task[None]] = None
+    _candidate_refresh_generation: int = 0
     _transaction_queue: Optional[TransactionQueue] = None
     _compact_vdf_sem: Optional[LimitedSemaphore] = None
     _new_peak_sem: Optional[LimitedSemaphore] = None
@@ -372,6 +376,7 @@ class FullNode:
                     self._transaction_queue_task.cancel()
                 cancel_task_safe(task=self.wallet_sync_task, log=self.log)
                 cancel_task_safe(task=self._sync_task, log=self.log)
+                cancel_task_safe(task=self._candidate_refresh_task, log=self.log)
 
                 for task_id, task in list(self.full_node_store.tx_fetch_tasks.items()):
                     cancel_task_safe(task, self.log)
@@ -380,6 +385,9 @@ class FullNode:
                 if self._sync_task is not None:
                     with contextlib.suppress(asyncio.CancelledError):
                         await self._sync_task
+                if self._candidate_refresh_task is not None:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self._candidate_refresh_task
 
     @property
     def block_store(self) -> BlockStore:
@@ -784,6 +792,46 @@ class FullNode:
             peak_block = await self.blockchain.get_full_peak()
         if peak_block is not None:
             peak = self.blockchain.block_record(peak_block.header_hash)
+            messages = []
+            # Refresh unsigned scheduling metadata before the peak triggers a
+            # reschedule. Do not change any candidate's signed reward block.
+            coefficients = {}
+            for candidate in self.full_node_store.get_pending_unfinished_blocks(peak.total_iters):
+                if candidate.prev_header_hash == peak.header_hash:
+                    continue
+                original_parent = self.blockchain.try_block_record(candidate.prev_header_hash)
+                if original_parent is None:
+                    continue
+                farmer = candidate.reward_chain_block.proof_of_space.farmer_public_key
+                if farmer not in coefficients:
+                    coefficients[farmer] = await self.blockchain.get_farmer_difficulty_coeff(farmer, peak.height)
+                current_coefficient = coefficients[farmer]
+                sub_slot_iters, candidate_difficulty = get_next_sub_slot_iters_and_difficulty(
+                    self.constants, len(candidate.finished_sub_slots) > 0, original_parent, self.blockchain
+                )
+                reward = candidate.reward_chain_block
+                if reward.reward_chain_sp_vdf is not None:
+                    rc_prev = reward.reward_chain_sp_vdf.challenge
+                elif reward.pos_ss_cc_challenge_hash == self.constants.GENESIS_CHALLENGE:
+                    rc_prev = self.constants.GENESIS_CHALLENGE
+                else:
+                    slot = self.full_node_store.get_sub_slot(reward.pos_ss_cc_challenge_hash)
+                    if slot is None:
+                        continue
+                    rc_prev = slot[0].reward_chain.get_hash()
+                entry = self.full_node_store.get_unfinished_block_result(
+                    reward.get_hash(), candidate.foliage.foliage_transaction_block_hash
+                )
+                candidate_ses = None
+                if entry is not None and entry.result is not None and entry.result.required_iters is not None:
+                    candidate_ses = next_sub_epoch_summary(
+                        self.constants, self.blockchain, entry.result.required_iters, candidate, True
+                    )
+                context = timelord_protocol.NewUnfinishedBlockTimelord(
+                    reward, candidate_difficulty, sub_slot_iters, candidate.foliage, candidate_ses, rc_prev,
+                    str(current_coefficient),
+                )
+                messages.append(make_msg(ProtocolMessageTypes.new_unfinished_block_timelord, context))
             difficulty = self.blockchain.get_next_difficulty(peak.header_hash, False)
             difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
                 peak.farmer_public_key, peak.height - 1 if peak.height > 0 else 0
@@ -828,10 +876,103 @@ class FullNode:
             )
 
             msg = make_msg(ProtocolMessageTypes.new_peak_timelord, timelord_new_peak)
+            messages.append(msg)
+            current = self.blockchain.get_peak()
+            if current is None or current.header_hash != peak.header_hash:
+                return
             if peer is None:
-                await self.server.send_to_all([msg], NodeType.TIMELORD)
+                await self.server.send_to_all(messages, NodeType.TIMELORD)
             else:
-                await self.server.send_to_specific([msg], peer.peer_node_id)
+                await self.server.send_to_specific(messages, peer.peer_node_id)
+
+    def _schedule_candidate_refresh(self) -> None:
+        self._candidate_refresh_generation += 1
+        if not self._shut_down and self.full_node_store.candidate_signing_peers and (
+            self._candidate_refresh_task is None or self._candidate_refresh_task.done()
+        ):
+            self._candidate_refresh_task = asyncio.create_task(self._refresh_candidate_blocks())
+
+    async def refresh_candidate_block(self, quality: bytes32) -> bool:
+        """Request a fresh plot signature if an intervening parent changed the IP."""
+        if self.sync_store.get_sync_mode() or self._server is None:
+            return False
+        signing_peer = self.full_node_store.candidate_signing_peers.get(quality)
+        if signing_peer is None:
+            return False
+        connection = self.server.all_connections.get(signing_peer)
+        if connection is None or connection.closed or connection.connection_type != NodeType.FARMER:
+            return False
+        async with self.timelord_lock:
+            async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
+                entry = self.full_node_store.get_candidate_block(quality)
+                parent = self.blockchain.get_peak()
+                if entry is None or parent is None:
+                    return False
+                candidate = entry[1]
+                if candidate.total_iters <= parent.total_iters or candidate.prev_header_hash == parent.header_hash:
+                    return False
+                coefficient = await self.blockchain.get_farmer_difficulty_coeff(
+                    candidate.reward_chain_block.proof_of_space.farmer_public_key, parent.height
+                )
+                try:
+                    refreshed = refresh_candidate_iterations(
+                        self.constants, self.blockchain, self.full_node_store, candidate, parent, coefficient
+                    )
+                except ValueError as error:
+                    self.log.warning("Cannot refresh candidate %s at parent %s: %s", quality.hex(), parent.height, error)
+                    return False
+                if refreshed is None:
+                    return False
+                self.full_node_store.add_candidate_block(quality, uint32(parent.height + 1), refreshed)
+                self.full_node_store.candidate_backup_blocks.pop(quality, None)
+                request = farmer_protocol.RequestSignedValues(
+                    quality, refreshed.foliage.foliage_block_data.get_hash(),
+                    refreshed.foliage.foliage_transaction_block_hash or bytes32([0] * 32),
+                    foliage_block_data=refreshed.foliage.foliage_block_data,
+                    foliage_transaction_block_data=refreshed.foliage_transaction_block,
+                    rc_block_unfinished=refreshed.reward_chain_block,
+                )
+                self.log.info(
+                    "Refreshing candidate %s after parent advance: parent %s, coefficient %s, total iters %s -> %s; "
+                    "requesting a new plot signature",
+                    quality.hex(), parent.height, coefficient, candidate.total_iters, refreshed.total_iters,
+                )
+        await connection.send_message(make_msg(ProtocolMessageTypes.request_signed_values, request))
+        return True
+
+    async def _refresh_candidate_blocks(self) -> None:
+        try:
+            while not self._shut_down and not self.sync_store.get_sync_mode():
+                generation = self._candidate_refresh_generation
+                parent = self.blockchain.get_peak()
+                if parent is None:
+                    return
+                for quality in list(self.full_node_store.candidate_signing_peers):
+                    if self._shut_down or self.sync_store.get_sync_mode():
+                        return
+                    try:
+                        await self.refresh_candidate_block(quality)
+                    except Exception:
+                        self.log.exception("Failed to refresh candidate %s", quality.hex())
+                current = self.blockchain.get_peak()
+                if current is None or (
+                    current.header_hash == parent.header_hash and generation == self._candidate_refresh_generation
+                ):
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def _candidate_scheduling_coefficient(self, block: UnfinishedBlock, original: Decimal) -> Decimal:
+        while True:
+            parent = self.blockchain.get_peak()
+            if parent is None or parent.header_hash == block.prev_header_hash:
+                return original
+            coefficient = await self.blockchain.get_farmer_difficulty_coeff(
+                block.reward_chain_block.proof_of_space.farmer_public_key, parent.height
+            )
+            current = self.blockchain.get_peak()
+            if current is not None and current.header_hash == parent.header_hash:
+                return coefficient
 
     async def synced(self, block_is_current_at: Optional[uint64] = None) -> bool:
         if block_is_current_at is None:
@@ -1613,6 +1754,7 @@ class FullNode:
 
         if self.sync_store.get_sync_mode() is False:
             await self.send_peak_to_timelords(block)
+            self._schedule_candidate_refresh()
             await self.broadcast_removed_tx(ppp_result.mempool_removals)
 
             # Tell full nodes about the new peak
@@ -2034,6 +2176,12 @@ class FullNode:
         pre_validation_log = (
             f"pre_validation time {pre_validation_time:0.4f}, " if pre_validation_time is not None else ""
         )
+        iteration_context = (
+            f"parent: {block.prev_header_hash.hex()}, "
+            f"parent height: {prev_b.height if prev_b is not None else -1}, "
+            f"coefficient: {difficulty_coeff}, required iters: {validate_result.required_iters}, "
+            f"total iters: {block.total_iters}"
+        )
         block_duration_in_seconds = (
                 receive_time - self.signage_point_times[block.reward_chain_block.signage_point_index]
         )
@@ -2041,7 +2189,7 @@ class FullNode:
             self.log.info(
                 f"🍀 ️Farmed unfinished_block {block_hash}, SP: {block.reward_chain_block.signage_point_index}, "
                 f"validation time: {validation_time:0.4f} seconds, {pre_validation_log}"
-                f"cost: {block.transactions_info.cost if block.transactions_info else 'None'} "
+                f"cost: {block.transactions_info.cost if block.transactions_info else 'None'} {iteration_context}"
             )
         else:
             percent_full_str = (
@@ -2061,7 +2209,7 @@ class FullNode:
                 f"Pool pk {encode_puzzle_hash(block.foliage.foliage_block_data.pool_target.puzzle_hash, 'gl')}, "
                 f"validation time: {validation_time:0.4f} seconds, {pre_validation_log}"
                 f"cost: {block.transactions_info.cost if block.transactions_info else 'None'}"
-                f"{percent_full_str}"
+                f"{percent_full_str}, {iteration_context}"
             )
 
         sub_slot_iters, difficulty = get_next_sub_slot_iters_and_difficulty(
@@ -2085,6 +2233,7 @@ class FullNode:
             assert block.reward_chain_block.reward_chain_sp_vdf is not None
             rc_prev = block.reward_chain_block.reward_chain_sp_vdf.challenge
 
+        scheduling_coefficient = await self._candidate_scheduling_coefficient(block, difficulty_coeff)
         timelord_request = timelord_protocol.NewUnfinishedBlockTimelord(
             block.reward_chain_block,
             difficulty,
@@ -2092,7 +2241,7 @@ class FullNode:
             block.foliage,
             ses,
             rc_prev,
-            str(difficulty_coeff),
+            str(scheduling_coefficient),
         )
 
         timelord_msg = make_msg(ProtocolMessageTypes.new_unfinished_block_timelord, timelord_request)
@@ -2229,7 +2378,15 @@ class FullNode:
         try:
             await self.add_block(block, None, self._bls_cache, raise_on_disconnected=True)
         except Exception as e:
-            self.log.warning(f"Consensus error validating block: {e}")
+            self.log.warning(
+                f"Consensus error validating block: {e}; "
+                f"unfinished reward hash: {request.unfinished_reward_hash.hex()}, "
+                f"original parent: {unfinished_block.prev_header_hash.hex()}, "
+                f"final parent: {block.prev_header_hash.hex()}, "
+                f"declared total iters: {unfinished_block.total_iters}, "
+                f"CC IP iters: {request.challenge_chain_ip_vdf.number_of_iterations}, "
+                f"RC IP iters: {request.reward_chain_ip_vdf.number_of_iterations}"
+            )
             if timelord_peer is not None:
                 # Only sends to the timelord who sent us this VDF, to reset them to the correct peak
                 await self.send_peak_to_timelords(peer=timelord_peer)
@@ -2324,6 +2481,7 @@ class FullNode:
                 )
                 msg = make_msg(ProtocolMessageTypes.new_signage_point, broadcast_farmer)
                 await self.server.send_to_all([msg], NodeType.FARMER)
+                self._schedule_candidate_refresh()
                 return None, True
             else:
                 self.log.info(

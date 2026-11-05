@@ -1,0 +1,79 @@
+ARG VERIFIED_RUNTIME=gold-candidate-refresh-deb-test:2.0.5-20261103
+FROM ${VERIFIED_RUNTIME} AS runtime
+
+FROM ubuntu:26.04.1 AS tools
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_BUILD_JOBS=2 \
+    VIRTUAL_ENV=/opt/venv
+RUN apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    ca-certificates git build-essential cmake pkg-config \
+    python3.14 python3.14-dev python3.14-venv \
+    libgmp-dev libboost-python-dev libboost-system-dev libssl-dev libffi-dev \
+    binutils patchelf \
+    && rm -rf /var/lib/apt/lists/*
+
+FROM tools AS package
+COPY --from=runtime /opt/gold/venv /opt/venv
+COPY --from=runtime /usr/bin/python3.12 /opt/gold-python/bin/python3.12
+COPY --from=runtime /usr/lib/python3.12 /opt/gold-python/lib/python3.12
+RUN ln -sfn /opt/gold-python/bin/python3.12 /opt/venv/bin/python3 \
+    && ln -sfn python3 /opt/venv/bin/python \
+    && ln -sfn python3 /opt/venv/bin/python3.12 \
+    && sed -i 's|/usr/bin|/opt/gold-python/bin|g' /opt/venv/pyvenv.cfg
+COPY g-timelord/setup.py g-timelord/pyproject.toml g-timelord/README.md g-timelord/LICENSE /build/gold-src/
+COPY g-timelord/chia /build/gold-src/chia
+COPY g-timelord/mozilla-ca /build/gold-src/mozilla-ca
+COPY g-timelord/build_scripts/__init__.py /build/gold-src/build_scripts/__init__.py
+COPY g-timelord/build_scripts/assets/systemd /build/gold-src/build_scripts/assets/systemd
+COPY g-timelord/build_scripts/timelord-recovery /build/gold-src/build_scripts/timelord-recovery
+RUN --network=none /opt/venv/bin/python /build/gold-src/build_scripts/timelord-recovery/verify_ubuntu26_compatibility.py \
+    --expect-original-failure --output /out/original-loader-failure.json
+ARG VERIFIED_IMAGE_ID=unknown
+ARG GOLD_SOURCE_REVISION=unknown
+ARG GOLD_NATIVE_REVISION=unknown
+RUN --network=none /opt/venv/bin/python /build/gold-src/build_scripts/timelord-recovery/build_deb.py \
+    --source /build/gold-src --output /out --version 2.0.5 \
+    --target-ubuntu 26.04 --filename-suffix _ubuntu26.04.1 \
+    --bundled-python /opt/gold-python --base-image-id "${VERIFIED_IMAGE_ID}" \
+    --source-revision "${GOLD_SOURCE_REVISION}" --native-revision "${GOLD_NATIVE_REVISION}"
+
+FROM ubuntu:26.04.1 AS verify
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PATH="/opt/gold/venv/bin:${PATH}" \
+    GOLD_ACCEPTANCE_SECONDS=480 \
+    GOLD_ROOT=/tmp/gold-runtime-smoke/mainnet \
+    GOLD_KEYS_ROOT=/tmp/gold-runtime-smoke/keys
+COPY --from=package /out /out
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends binutils binutils-gold \
+    && sha256sum /usr/bin/gold > /out/binutils-gold-before.sha256 \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+    /out/gold-blockchain-cli_2.0.5_amd64_ubuntu26.04.1.deb \
+    && sha256sum -c /out/binutils-gold-before.sha256 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/gold/venv/lib/python3.12/site-packages
+COPY g-timelord/build_scripts/timelord-recovery/smoke_test.py /checks/smoke_test.py
+COPY g-timelord/build_scripts/timelord-recovery/docker_runtime_acceptance.py /checks/docker_runtime_acceptance.py
+COPY g-timelord/build_scripts/timelord-recovery/verify_deb_installation.py /checks/verify_deb_installation.py
+COPY g-timelord/build_scripts/timelord-recovery/verify_ubuntu26_compatibility.py /checks/verify_ubuntu26_compatibility.py
+RUN gold version && dpkg-query -W gold-blockchain-cli && python -m pip check \
+    && /usr/bin/gold --version \
+    && /usr/local/bin/gold version \
+    && test -x vdf_client && test -x vdf_bench
+RUN --network=none python /checks/verify_ubuntu26_compatibility.py --output /out/ubuntu26-compatibility.json
+RUN --network=none GOLD_TEST_REAL_IMPORTS=1 python chia/_tests/timelord/test_peak_recovery.py
+RUN --network=none python chia/_tests/timelord/test_iteration_consistency.py
+RUN --network=none GOLD_TEST_REAL_IMPORTS=1 python -m unittest chia._tests.timelord.test_candidate_refresh
+RUN --network=none python /checks/smoke_test.py \
+    && cp /opt/gold-image-verification.json /out/deb-vdf-verification.json
+LABEL gold.deb.version="2.0.5" \
+    gold.deb.filename="gold-blockchain-cli_2.0.5_amd64_ubuntu26.04.1.deb" \
+    gold.target.ubuntu="26.04.1" \
+    gold.timelord.included="true"
+CMD ["/bin/sh", "-c", "set -eu; python /checks/docker_runtime_acceptance.py; /opt/gold/venv/bin/python /checks/verify_deb_installation.py --package /out/gold-blockchain-cli_2.0.5_amd64_ubuntu26.04.1.deb"]

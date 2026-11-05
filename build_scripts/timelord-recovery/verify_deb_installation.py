@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sysconfig
@@ -12,7 +13,7 @@ import tarfile
 import tempfile
 
 
-PACKAGE = Path("/out/gold-blockchain-cli_2.0.5_amd64.deb")
+PACKAGE = Path(os.environ.get("GOLD_DEB_PACKAGE", "/out/gold-blockchain-cli_2.0.5_amd64.deb"))
 TEST_DATA = Path("/tmp/gold-runtime-smoke")
 SITE = Path(sysconfig.get_paths()["purelib"])
 
@@ -75,7 +76,7 @@ def main():
         assert "not found" not in output, output
         dynamic_links[filename] = output.splitlines()
     system_gold_owner = run("dpkg-query", "-S", "/usr/bin/gold")
-    assert system_gold_owner.startswith("binutils:"), system_gold_owner
+    assert system_gold_owner.split(":", 1)[0] in ("binutils", "binutils-gold"), system_gold_owner
     linker = Path("/usr/bin/gold")
     linker_hash = hashlib.sha256(linker.read_bytes()).hexdigest()
     assert linker_hash == Path("/out/binutils-gold-before.sha256").read_text().split()[0]
@@ -92,6 +93,20 @@ def main():
     build_info = json.loads(Path("/opt/gold/BUILD-INFO.json").read_text())
     assert build_info["version"] == args.package_version
     assert build_info["cli_version"] == args.cli_version
+    stack_checks = {}
+    if build_info.get("cleared_executable_stack_libraries"):
+        for name in build_info["cleared_executable_stack_libraries"]:
+            headers = run("readelf", "-lW", SITE / name)
+            stack = [line.strip() for line in headers.splitlines() if "GNU_STACK" in line]
+            assert stack and not any(" RWE " in f" {line} " for line in stack), (name, stack)
+            stack_checks[name] = stack
+    python_runtime = run(
+        "/opt/gold/venv/bin/python", "-c",
+        "import json, sys; print(json.dumps({'executable': sys.executable, 'base_prefix': sys.base_prefix}))",
+    )
+    if build_info.get("python_runtime") == "bundled":
+        assert json.loads(python_runtime)["base_prefix"] == "/opt/gold/python", python_runtime
+        assert "opt/gold/python/bin/python3.12" in members
     for name, expected in build_info["source_sha256"].items():
         assert hashlib.sha256((SITE / name).read_bytes()).hexdigest() == expected, name
     for name in ("vdf_client", "vdf_bench"):
@@ -144,6 +159,8 @@ def main():
         "no_packaged_system_linker": True,
         "cli_works_without_private_path": True,
         "dependency_check": dependency_check,
+        "non_executable_stack_checks": stack_checks,
+        "python_runtime": json.loads(python_runtime),
     }
     Path("/out/deb-installation-verification.json").write_text(
         json.dumps(result, indent=2) + "\n", encoding="utf-8"

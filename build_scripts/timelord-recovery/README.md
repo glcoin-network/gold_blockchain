@@ -255,3 +255,29 @@ lifecycle and removal/reinstallation. No host node data is needed.
 The package and CLI must both report `2.0.5`; the unchanged dependency image's
 older tag does not identify the new release. Keep Ubuntu 20.04 and 24.04 exports
 in separate directories even though their requested filenames are identical.
+
+## Ubuntu 26.04.1 Package
+
+The 26.04.1 package bundles the Python 3.12 interpreter, standard library and
+dependencies from the verified 2.0.5 Ubuntu 24.04 runtime under `/opt/gold`.
+The host's Python 3.14 is not used by Gold. This preserves the existing native
+bindings without upgrading PyO3 or changing consensus dependencies. Build the
+package and verify it in a clean Resolute base:
+
+```powershell
+docker build --platform linux/amd64 `
+  --file g-timelord/build_scripts/timelord-recovery/Dockerfile.ubuntu26.04 `
+  --tag gold-timelord-deb-verified:2.0.5-ubuntu26.04-amd64 .
+docker run --name gold-deb-resolute-acceptance --network none `
+  --cpus 4 --memory 3072m -e GOLD_ACCEPTANCE_SECONDS=480 `
+  gold-timelord-deb-verified:2.0.5-ubuntu26.04-amd64
+```
+
+Override `VERIFIED_RUNTIME` to select another verified Ubuntu 24.04/Python 3.12
+runtime. The default is `gold-candidate-refresh-deb-test:2.0.5-20261103`; record
+its image ID and native/source revisions with the provenance arguments above.
+The build clears malformed executable-stack declarations from native shared
+libraries, currently the `chiapos` BladeBit harvester library. It does not alter
+consensus, staking, block validation, or Timelord logic. The package is exported
+as `gold-blockchain-cli_2.0.5_amd64_ubuntu26.04.1.deb`. System library dependencies
+are installed by apt from the target release; no old Ubuntu apt sources are used.

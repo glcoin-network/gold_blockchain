@@ -106,7 +106,7 @@ def main():
     )
     if build_info.get("python_runtime") == "bundled":
         assert json.loads(python_runtime)["base_prefix"] == "/opt/gold/python", python_runtime
-        assert "opt/gold/python/bin/python3.12" in members
+        assert f"opt/gold/python/bin/python{build_info['python_version']}" in members
     for name, expected in build_info["source_sha256"].items():
         assert hashlib.sha256((SITE / name).read_bytes()).hexdigest() == expected, name
     for name in ("vdf_client", "vdf_bench"):

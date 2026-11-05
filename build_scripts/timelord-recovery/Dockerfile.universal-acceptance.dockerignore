@@ -1,0 +1,14 @@
+.git
+**/.git
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.venv
+**/venv
+**/node_modules
+**/target
+**/dist
+**/*.log
+**/*.deb
+**/*.plot
+**/.gold

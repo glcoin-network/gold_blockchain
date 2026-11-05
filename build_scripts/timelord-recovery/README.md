@@ -281,3 +281,34 @@ libraries, currently the `chiapos` BladeBit harvester library. It does not alter
 consensus, staking, block validation, or Timelord logic. The package is exported
 as `gold-blockchain-cli_2.0.5_amd64_ubuntu26.04.1.deb`. System library dependencies
 are installed by apt from the target release; no old Ubuntu apt sources are used.
+
+## One Package For Four Ubuntu Releases
+
+`Dockerfile.universal` builds one amd64 Debian package using the verified
+Ubuntu 20.04 native runtime and the current application source. It bundles
+Python 3.8 and the necessary non-glibc libraries under `/opt/gold`, without
+changing the host interpreter or exporting `LD_LIBRARY_PATH`. ELF RUNPATHs
+locate private dependencies relative to each binary. The build checks that
+executable sections remain unchanged, enforces the Focal ABI ceiling, and
+includes copyright notices for copied runtime libraries.
+
+```powershell
+docker build --platform linux/amd64 `
+  --file g-timelord/build_scripts/timelord-recovery/Dockerfile.universal `
+  --tag gold-universal-deb:2.0.5 g-timelord
+& ./g-timelord/build_scripts/timelord-recovery/verify_universal_matrix.ps1
+```
+
+The matrix installs the exact same `gold-blockchain-cli_2.0.5_amd64.deb` in
+Ubuntu 20.04, 22.04, 24.04 and 26.04.1. It checks native loading, required
+ABIs, native VDF proofs, candidate regressions, all six service processes,
+RPCs, service restart, wallet address persistence, SQLite and reinstall.
+The SHA256 must match on every target. Reports and the package are exported
+to `artifacts/releases/v2.0.5/universal`. A passing matrix covers containers;
+host systemd startup, production chain data and mainnet rewards are separate.
+
+The default 22.04 test base is `gold-ubuntu-base:22.04`, imported from the
+Canonical Ubuntu Base amd64 tarball after checking its published SHA256 when
+Docker Hub is unavailable. Replace that base with `ubuntu:22.04` when available.
+The private Focal Python/OpenSSL runtime needs ongoing security maintenance;
+host apt updates do not automatically update libraries bundled inside this deb.

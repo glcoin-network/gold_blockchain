@@ -16,6 +16,11 @@ import tempfile
 
 
 TARGETS = {
+    "universal": {
+        "python": "3.8",
+        "bundled_python": True,
+        "depends": "libc6 (>= 2.31), libstdc++6 (>= 10), libgcc-s1, ca-certificates, netcat-openbsd",
+    },
     "20.04": {
         "python": "3.8",
         "depends": (
@@ -97,7 +102,7 @@ def set_release_version(setup_path, version):
     return old_version
 
 
-def copy_runtime(source, stage, wheel, python_version, bundled_python=None):
+def copy_runtime(source, stage, wheel, python_version, bundled_python=None, portable=False):
     runtime = stage / "opt/gold/venv"
     shutil.copytree("/opt/venv", runtime, symlinks=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     site = runtime / f"lib/python{python_version}/site-packages"
@@ -110,7 +115,7 @@ def copy_runtime(source, stage, wheel, python_version, bundled_python=None):
     generated_bin = site / "bin"
     if generated_bin.exists():
         shutil.rmtree(generated_bin)
-    patched_execstack = clear_incompatible_executable_stacks(site) if bundled_python is not None else []
+    patched_execstack = clear_incompatible_executable_stacks(site) if bundled_python is not None and not portable else []
     python3 = runtime / "bin/python3"
     python3.unlink()
     if bundled_python is None:
@@ -166,6 +171,10 @@ def copy_runtime(source, stage, wheel, python_version, bundled_python=None):
     user_bin = stage / "usr/local/bin"
     user_bin.mkdir(parents=True, exist_ok=True)
     (user_bin / "gold").symlink_to("/opt/gold/gold")
+    if portable:
+        from portable_runtime import prepare_portable_runtime
+
+        patched_execstack = prepare_portable_runtime(stage)
     return site, patched_execstack
 
 
@@ -242,7 +251,10 @@ def main():
         )
         wheel = next(wheels.glob("gold_blockchain-*.whl"))
         stage = work / "root"
-        site, patched_execstack = copy_runtime(source, stage, wheel, python_version, args.bundled_python)
+        site, patched_execstack = copy_runtime(
+            source, stage, wheel, python_version, args.bundled_python,
+            portable=args.target_ubuntu == "universal",
+        )
         copy_units(source, stage)
         provenance = {
             "package": "gold-blockchain-cli",
@@ -260,6 +272,10 @@ def main():
             "gold_rs_revision": args.native_revision,
             "recovery_timeout_seconds": 15,
             "cleared_executable_stack_libraries": patched_execstack,
+            "supported_ubuntu": (
+                ["20.04", "22.04", "24.04", "26.04"]
+                if args.target_ubuntu == "universal" else [args.target_ubuntu]
+            ),
             "source_sha256": {
                 name: hashlib.sha256((site / name).read_bytes()).hexdigest()
                 for name in (

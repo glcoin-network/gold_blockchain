@@ -1,0 +1,26 @@
+ARG VERIFIED_RUNTIME=gold-timelord-recovery:ubuntu20.04-amd64
+FROM ${VERIFIED_RUNTIME} AS package
+USER root
+RUN apt-get -o Acquire::Retries=3 update \
+    && apt-get -o Acquire::Retries=3 install -y --no-install-recommends patchelf binutils \
+    && rm -rf /var/lib/apt/lists/*
+COPY setup.py pyproject.toml README.md LICENSE /build/gold-src/
+COPY chia /build/gold-src/chia
+COPY mozilla-ca /build/gold-src/mozilla-ca
+COPY build_scripts/__init__.py /build/gold-src/build_scripts/__init__.py
+COPY build_scripts/assets/systemd /build/gold-src/build_scripts/assets/systemd
+COPY build_scripts/timelord-recovery /build/gold-src/build_scripts/timelord-recovery
+RUN mkdir -p /opt/gold-python/bin /opt/gold-python/lib \
+    && cp /usr/bin/python3.8 /opt/gold-python/bin/python3.8 \
+    && cp -aL /usr/lib/python3.8 /opt/gold-python/lib/python3.8
+ARG VERIFIED_IMAGE_ID=unknown
+ARG GOLD_SOURCE_REVISION=unknown
+ARG GOLD_NATIVE_REVISION=unknown
+RUN --network=none /opt/venv/bin/python /build/gold-src/build_scripts/timelord-recovery/build_deb.py \
+    --source /build/gold-src --output /universal-out --version 2.0.5 \
+    --target-ubuntu universal --bundled-python /opt/gold-python \
+    --base-image-id "${VERIFIED_IMAGE_ID}" --source-revision "${GOLD_SOURCE_REVISION}" \
+    --native-revision "${GOLD_NATIVE_REVISION}"
+LABEL gold.deb.version="2.0.5" gold.supported.ubuntu="20.04,22.04,24.04,26.04"
+ENTRYPOINT ["/bin/sh"]
+CMD ["-c", "ls -lh /universal-out"]

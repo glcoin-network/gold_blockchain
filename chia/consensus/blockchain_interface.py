@@ -10,6 +10,7 @@ from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.blockchain_format.sub_epoch_summary import SubEpochSummary
 from chia.types.blockchain_format.vdf import VDFInfo
 from chia.types.header_block import HeaderBlock
+from chia.types.full_block import FullBlock
 from chia.types.weight_proof import SubEpochChallengeSegment
 from chia.util.ints import uint32
 
@@ -106,6 +107,8 @@ class BlockchainInterface:
         return  # type: ignore[return-value]
 
     async def get_farmer_difficulty_coeff(
-        self, farmer_public_key: G1Element, height: Optional[uint32] = None
+        self, farmer_public_key: G1Element, height: Optional[uint32] = None,
+        *, parent_hash: Optional[bytes32] = None,
+        additional_blocks: Optional[Dict[bytes32, FullBlock]] = None,
     ) -> Decimal:
         raise NotImplementedError("get_farmer_difficulty_coeff not implemented")

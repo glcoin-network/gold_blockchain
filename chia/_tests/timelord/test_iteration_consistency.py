@@ -400,7 +400,8 @@ class CandidateHeightTest(unittest.IsolatedAsyncioTestCase):
         async def acquire(**kwargs):
             yield
 
-        async def coefficient(pk, height=None):
+        async def coefficient(pk, height=None, *, parent_hash=None):
+            self.assertEqual(parent_hash, parent.header_hash)
             return Decimal("0.5") if height == parent.height else Decimal(20)
 
         rc_sp = VDFInfo(parent.reward_infusion_new_challenge, uint64(1),
@@ -442,7 +443,9 @@ class CandidateHeightTest(unittest.IsolatedAsyncioTestCase):
                 foliage=genesis.foliage, is_transaction_block=lambda: False),
         ) as create:
             await api.declare_proof_of_space(request, peer)
-        chain.get_farmer_difficulty_coeff.assert_awaited_once_with(PK, parent.height)
+        chain.get_farmer_difficulty_coeff.assert_awaited_once_with(
+            PK, parent.height, parent_hash=parent.header_hash
+        )
         expected_required = calculate_iterations_quality(
             CONSTANTS.DIFFICULTY_CONSTANT_FACTOR, QUALITY, 32, uint64(7),
             Decimal("0.5"), request.challenge_chain_sp,

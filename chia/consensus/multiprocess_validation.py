@@ -179,6 +179,9 @@ async def pre_validate_blocks_multiprocessing(
     wp_summaries: Optional[List[SubEpochSummary]] = None,
     *,
     validate_signatures: bool = True,
+    coefficient_for_block: Optional[
+        Callable[[FullBlock, Dict[bytes32, FullBlock]], Awaitable[Decimal]]
+    ] = None,
 ) -> List[PreValidationResult]:
     """
     This method must be called under the blockchain lock
@@ -230,6 +233,7 @@ async def pre_validate_blocks_multiprocessing(
         block_record_was_present.append(block_records.contains_block(header_hash))
 
     diff_ssis: List[Tuple[uint64, uint64, Decimal]] = []
+    coefficient_ancestors: Dict[bytes32, FullBlock] = {}
     for index, block in enumerate(blocks):
         if block.height != 0:
             if prev_b is None:
@@ -278,7 +282,10 @@ async def pre_validate_blocks_multiprocessing(
                     block_records.remove_block_record(block_hashes[i])
             return [PreValidationResult(uint16(Err.INVALID_POSPACE.value), None, None, False, uint32(0))]
 
-        difficulty_coeff = difficulty_coeffs[index]
+        difficulty_coeff = (
+            await coefficient_for_block(block, coefficient_ancestors)
+            if coefficient_for_block is not None else difficulty_coeffs[index]
+        )
         log.debug(f"[debug] validating {block.reward_chain_block.height}, {difficulty_coeff}")
         required_iters: uint64 = calculate_iterations_quality(
             constants.DIFFICULTY_CONSTANT_FACTOR,
@@ -313,6 +320,7 @@ async def pre_validate_blocks_multiprocessing(
         else:
             recent_blocks[block_rec.header_hash] = block_records.block_record(block_rec.header_hash)
         prev_b = block_rec
+        coefficient_ancestors[block.header_hash] = block
         diff_ssis.append((difficulty, sub_slot_iters, difficulty_coeff))
 
     block_dict: Dict[bytes32, FullBlock] = {}

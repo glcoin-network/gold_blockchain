@@ -209,7 +209,8 @@ class WeightProofHandler:
                 return None
             recent_chain.insert(0, header_block)
             difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
-                header_block.reward_chain_block.proof_of_space.farmer_public_key, curr_height - 1
+                header_block.reward_chain_block.proof_of_space.farmer_public_key, curr_height - 1,
+                parent_hash=header_block.prev_header_hash,
             )
             difficulty_coeffs.insert(0, str(difficulty_coeff))
             if block_rec.sub_epoch_summary_included:
@@ -224,6 +225,7 @@ class WeightProofHandler:
         difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
             header_block.reward_chain_block.proof_of_space.farmer_public_key,
             curr_height - 1 if curr_height > 0 else 0,
+            parent_hash=header_block.prev_header_hash,
         )
         difficulty_coeffs.insert(0, str(difficulty_coeff))
 

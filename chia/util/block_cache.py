@@ -11,6 +11,7 @@ from chia.consensus.blockchain_interface import BlockchainInterface
 from chia.types.blockchain_format.sized_bytes import bytes32
 from chia.types.blockchain_format.sub_epoch_summary import SubEpochSummary
 from chia.types.header_block import HeaderBlock
+from chia.types.full_block import FullBlock
 from chia.types.weight_proof import SubEpochChallengeSegment, SubEpochSegments
 from chia.util.ints import uint32
 
@@ -114,7 +115,11 @@ class BlockCache(BlockchainInterface):
         return segments.challenge_segments
 
     async def get_farmer_difficulty_coeff(
-        self, farmer_public_key: G1Element, height: Optional[uint32] = None
+        self, farmer_public_key: G1Element, height: Optional[uint32] = None,
+        *, parent_hash: Optional[bytes32] = None,
+        additional_blocks: Optional[Dict[bytes32, FullBlock]] = None,
     ) -> Decimal:
-        return await self._inner.get_farmer_difficulty_coeff(farmer_public_key, height)
+        return await self._inner.get_farmer_difficulty_coeff(
+            farmer_public_key, height, parent_hash=parent_hash, additional_blocks=additional_blocks
+        )
 

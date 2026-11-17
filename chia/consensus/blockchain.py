@@ -813,27 +813,36 @@ class Blockchain(BlockchainInterface):
         *,
         validate_signatures: bool,
     ) -> List[PreValidationResult]:
-        difficulty_coeffs = []
-        for block in blocks:
-            difficulty_coeffs.append(
-                await self.get_farmer_difficulty_coeff(
-                    block.reward_chain_block.proof_of_space.farmer_public_key,
-                    block.height - 1 if block.height > 0 else 0,
-                )
+        async def coefficient_for_block(
+            block: FullBlock, additional_blocks: Dict[bytes32, FullBlock]
+        ) -> Decimal:
+            return await self.get_farmer_difficulty_coeff(
+                block.reward_chain_block.proof_of_space.farmer_public_key,
+                uint32(block.height - 1 if block.height > 0 else 0),
+                parent_hash=block.prev_header_hash,
+                additional_blocks=additional_blocks,
             )
-        return await pre_validate_blocks_multiprocessing(
-            self.constants,
-            self,
-            blocks,
-            difficulty_coeffs,
-            self.pool,
-            True,
-            npc_results,
-            self.get_block_generator,
-            batch_size,
-            wp_summaries,
-            validate_signatures=validate_signatures,
-        )
+
+        present = {block.header_hash for block in blocks if self.contains_block(block.header_hash)}
+        try:
+            return await pre_validate_blocks_multiprocessing(
+                self.constants,
+                self,
+                blocks,
+                [],
+                self.pool,
+                True,
+                npc_results,
+                self.get_block_generator,
+                batch_size,
+                wp_summaries,
+                validate_signatures=validate_signatures,
+                coefficient_for_block=coefficient_for_block,
+            )
+        finally:
+            for block in blocks:
+                if block.header_hash not in present and self.contains_block(block.header_hash):
+                    self.remove_block_record(block.header_hash)
 
     async def run_generator(self, unfinished_block: bytes, generator: BlockGenerator, height: uint32) -> NPCResult:
         task = asyncio.get_running_loop().run_in_executor(
@@ -1139,10 +1148,10 @@ class Blockchain(BlockchainInterface):
         return BlockGenerator(block.transactions_generator, result, [])
 
     async def get_network_space(self, newer: bytes32, older: bytes32) -> uint128:
-        newer_block = await self.block_store.get_block_record(newer)
+        newer_block = await self.get_block_record_from_db(newer)
         if newer_block is None:
             raise ValueError("Newer block not found")
-        older_block = await self.block_store.get_block_record(older)
+        older_block = await self.get_block_record_from_db(older)
         if older_block is None:
             raise ValueError("Older block not found")
         delta_weight = newer_block.weight - older_block.weight
@@ -1161,35 +1170,114 @@ class Blockchain(BlockchainInterface):
 
     async def get_peak_network_space(self, block_range: int, peak: Optional[BlockRecord]) -> uint128:
         if peak is not None and peak.height > 1:
-            # Average over the last day
-            older_header_hash = self.height_to_hash(uint32(max(1, peak.height - block_range)))
-            assert older_header_hash is not None
-            return await self.get_network_space(peak.header_hash, older_header_hash)
+            older = await self._coefficient_ancestor(peak, uint32(max(1, peak.height - block_range)))
+            return await self.get_network_space(peak.header_hash, older.header_hash)
         else:
             return uint128(0)
 
-    async def get_peak_farmer_staking(self, farmer_public_key: G1Element, peak: Optional[BlockRecord]) -> uint64:
+    async def _coefficient_ancestor(self, peak: BlockRecord, height: uint32) -> BlockRecord:
+        """Resolve an ancestor on this branch, without substituting a same-height sibling."""
+        if height > peak.height:
+            raise ValueError("Coefficient ancestor is above its parent")
+        current = peak
+        while current.height > height:
+            if self.height_to_hash(current.height) == current.header_hash:
+                header_hash = self.height_to_hash(height)
+                if header_hash is None:
+                    raise ValueError(f"Missing coefficient ancestor at height {height}")
+            else:
+                header_hash = current.prev_hash
+            record = await self.get_block_record_from_db(header_hash)
+            if record is None:
+                raise ValueError(f"Missing coefficient ancestor {header_hash.hex()}")
+            if record.height >= current.height:
+                raise ValueError("Invalid coefficient ancestor height")
+            current = record
+        if current.height != height:
+            raise ValueError("Coefficient ancestor has an unexpected height")
+        return current
+
+    async def get_peak_farmer_staking(
+        self,
+        farmer_public_key: G1Element,
+        peak: Optional[BlockRecord],
+        additional_blocks: Optional[Dict[bytes32, FullBlock]] = None,
+    ) -> uint64:
         ph = create_puzzlehash_for_pk(farmer_public_key)
-        coins = await self.coin_store.get_unspent_coins_before_height(ph, peak.height if peak is not None else 0)
-        return uint64(sum(coin.coin.amount for coin in coins))
+        if peak is None or peak.height == 0:
+            return uint64(0)
+        if self.height_to_hash(peak.height) == peak.header_hash:
+            coins = await self.coin_store.get_unspent_coins_before_height(ph, peak.height)
+            return uint64(sum(coin.coin.amount for coin in coins))
+
+        # Preserve the existing exclusive height boundary: stake is measured
+        # before the parent's height, not after the parent or candidate.
+        current = await self._coefficient_ancestor(peak, uint32(peak.height - 1))
+        fork_blocks: List[BlockRecord] = []
+        while self.height_to_hash(current.height) != current.header_hash:
+            fork_blocks.append(current)
+            if current.height == 0:
+                break
+            current = await self._coefficient_ancestor(current, uint32(current.height - 1))
+
+        common_height = int(current.height)
+        common_hash = current.header_hash
+        if fork_blocks and fork_blocks[-1].height == 0:
+            common_height = -1
+            common_hash = self.constants.GENESIS_CHALLENGE
+        coins = await self.coin_store.get_unspent_coins_before_height(ph, uint32(common_height + 1))
+        amounts = {record.name: record.coin.amount for record in coins}
+        fork_info = ForkInfo(common_height, common_height, common_hash)
+        pending = additional_blocks if additional_blocks is not None else {}
+        for record in reversed(fork_blocks):
+            block = pending.get(record.header_hash)
+            if block is None:
+                block = await self.block_store.get_full_block(record.header_hash)
+            if block is None:
+                raise ValueError(f"Missing coefficient fork block {record.header_hash.hex()}")
+            await self.run_single_block(block, fork_info, pending)
+        for coin_id in fork_info.removals_since_fork:
+            amounts.pop(coin_id, None)
+        for coin_id, addition in fork_info.additions_since_fork.items():
+            if addition.coin.puzzle_hash == ph and coin_id not in fork_info.removals_since_fork:
+                amounts[coin_id] = addition.coin.amount
+        return uint64(sum(amounts.values()))
 
     async def get_farmer_difficulty_coeff(
         self,
         farmer_public_key: G1Element,
         height: Optional[uint32] = None,
         blocks: Optional[uint64] = None,
+        *,
+        parent_hash: Optional[bytes32] = None,
+        additional_blocks: Optional[Dict[bytes32, FullBlock]] = None,
     ) -> Decimal:
         block_range = self.constants.STAKING_ESTIMATE_BLOCK_RANGE
 
         peak: Optional[BlockRecord] = None
         peak_height = height
-        if peak_height is None:
+        if peak_height is None and parent_hash is None:
             peak_height = self._peak_height
-        if peak_height is not None:
+        if peak_height == 0:
+            return Decimal(20)
+        if parent_hash is not None:
+            if parent_hash == self.constants.GENESIS_CHALLENGE:
+                return Decimal(20)
+            peak = await self.get_block_record_from_db(parent_hash)
+            if peak is None:
+                raise ValueError(f"Missing coefficient parent {parent_hash.hex()}")
+            if peak_height is not None and peak.height != peak_height:
+                raise ValueError("Coefficient parent height does not match its hash")
+            peak_height = peak.height
             if peak_height == 0:
                 return Decimal(20)
+        elif peak_height is not None:
             header_hash = self.height_to_hash(peak_height)
-            peak = await self.block_store.get_block_record(header_hash)
+            if header_hash is None:
+                raise ValueError(f"Missing coefficient parent at height {peak_height}")
+            peak = await self.get_block_record_from_db(header_hash)
+            if peak is None:
+                raise ValueError(f"Missing coefficient parent {header_hash.hex()}")
 
         if blocks is None:
             curr: Optional[BlockRecord] = peak
@@ -1198,9 +1286,14 @@ class Blockchain(BlockchainInterface):
             while curr is not None and curr.height > begin_height:
                 if curr.farmer_public_key == farmer_public_key:
                     blocks += 1
-                curr = self.try_block_record(curr.prev_hash)
+                if curr.height - 1 <= begin_height:
+                    break
+                previous = await self.get_block_record_from_db(curr.prev_hash)
+                if previous is None or previous.height != curr.height - 1:
+                    raise ValueError(f"Missing coefficient history before {curr.header_hash.hex()}")
+                curr = previous
         network_space = await self.get_peak_network_space(block_range, peak)
-        staking = await self.get_peak_farmer_staking(farmer_public_key, peak)
+        staking = await self.get_peak_farmer_staking(farmer_public_key, peak, additional_blocks)
         minimal_staking = Decimal(str(network_space)) / (block_range * 100)
 
         coeff = Decimal(20)

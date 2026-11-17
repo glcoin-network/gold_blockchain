@@ -804,7 +804,9 @@ class FullNode:
                     continue
                 farmer = candidate.reward_chain_block.proof_of_space.farmer_public_key
                 if farmer not in coefficients:
-                    coefficients[farmer] = await self.blockchain.get_farmer_difficulty_coeff(farmer, peak.height)
+                    coefficients[farmer] = await self.blockchain.get_farmer_difficulty_coeff(
+                        farmer, peak.height, parent_hash=peak.header_hash
+                    )
                 current_coefficient = coefficients[farmer]
                 sub_slot_iters, candidate_difficulty = get_next_sub_slot_iters_and_difficulty(
                     self.constants, len(candidate.finished_sub_slots) > 0, original_parent, self.blockchain
@@ -834,7 +836,8 @@ class FullNode:
                 messages.append(make_msg(ProtocolMessageTypes.new_unfinished_block_timelord, context))
             difficulty = self.blockchain.get_next_difficulty(peak.header_hash, False)
             difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
-                peak.farmer_public_key, peak.height - 1 if peak.height > 0 else 0
+                peak.farmer_public_key, peak.height - 1 if peak.height > 0 else 0,
+                parent_hash=peak.prev_hash,
             )
             ses: Optional[SubEpochSummary] = next_sub_epoch_summary(
                 self.constants,
@@ -912,7 +915,8 @@ class FullNode:
                 if candidate.total_iters <= parent.total_iters or candidate.prev_header_hash == parent.header_hash:
                     return False
                 coefficient = await self.blockchain.get_farmer_difficulty_coeff(
-                    candidate.reward_chain_block.proof_of_space.farmer_public_key, parent.height
+                    candidate.reward_chain_block.proof_of_space.farmer_public_key, parent.height,
+                    parent_hash=parent.header_hash,
                 )
                 try:
                     refreshed = refresh_candidate_iterations(
@@ -968,7 +972,8 @@ class FullNode:
             if parent is None or parent.header_hash == block.prev_header_hash:
                 return original
             coefficient = await self.blockchain.get_farmer_difficulty_coeff(
-                block.reward_chain_block.proof_of_space.farmer_public_key, parent.height
+                block.reward_chain_block.proof_of_space.farmer_public_key, parent.height,
+                parent_hash=parent.header_hash,
             )
             current = self.blockchain.get_peak()
             if current is not None and current.header_hash == parent.header_hash:
@@ -2098,12 +2103,12 @@ class FullNode:
         npc_result: Optional[NPCResult] = None
         pre_validation_time = None
 
-        difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
-            block.reward_chain_block.proof_of_space.farmer_public_key,
-            uint32(prev_b.height if prev_b is not None and prev_b.height > 0 else 0),
-        )
-
         async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
+            difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
+                block.reward_chain_block.proof_of_space.farmer_public_key,
+                uint32(prev_b.height if prev_b is not None else 0),
+                parent_hash=block.prev_header_hash,
+            )
             start_header_time = time.monotonic()
             _, header_error = await self.blockchain.validate_unfinished_block_header(block, difficulty_coeff)
             if header_error is not None:

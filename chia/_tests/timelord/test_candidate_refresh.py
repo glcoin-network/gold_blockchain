@@ -440,7 +440,8 @@ class CandidateRefreshFlowTest(unittest.IsolatedAsyncioTestCase):
             header_hash=std_hash(b"peak-during-coefficient-read"), height=uint32(self.parent.height + 1)
         )
 
-        async def coefficient(farmer, height):
+        async def coefficient(farmer, height, *, parent_hash=None):
+            self.assertEqual(parent_hash, first.header_hash if height == first.height else latest.header_hash)
             if height == first.height:
                 self.parent = latest
                 return Decimal(10)

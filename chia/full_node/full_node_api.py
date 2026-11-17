@@ -953,7 +953,7 @@ class FullNodeAPI:
 
                 # Match the parent context used to validate this unfinished header.
                 difficulty_coeff = await self.full_node.blockchain.get_farmer_difficulty_coeff(
-                    request.proof_of_space.farmer_public_key, prev_b.height
+                    request.proof_of_space.farmer_public_key, prev_b.height, parent_hash=prev_b.header_hash
                 )
 
             if peak is None or peak.height <= self.full_node.constants.MAX_SUB_SLOT_BLOCKS:
@@ -1237,6 +1237,7 @@ class FullNodeAPI:
         difficulty_coeff = await self.full_node.blockchain.get_farmer_difficulty_coeff(
             block.reward_chain_block.proof_of_space.farmer_public_key,
             block.height - 1 if block.height > 0 else 0,
+            parent_hash=block.prev_header_hash,
         )
         msg = make_msg(
             ProtocolMessageTypes.respond_block_header,

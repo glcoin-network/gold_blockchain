@@ -662,6 +662,51 @@ class CoinStore:
                         coin_dict[record.name] = record
         return list(coin_dict.values())
 
+    async def get_unspent_amounts_at_heights(
+        self, heights_by_puzzle_hash: Dict[bytes32, List[uint32]]
+    ) -> Dict[bytes32, Dict[uint32, uint64]]:
+        """Calculate historical balances with the same exclusive boundary as stake queries."""
+        heights_by_puzzle_hash = {
+            puzzle_hash: sorted(set(heights))
+            for puzzle_hash, heights in heights_by_puzzle_hash.items()
+            if heights
+        }
+        if not heights_by_puzzle_hash:
+            return {}
+        start_height = min(heights[0] for heights in heights_by_puzzle_hash.values())
+        end_height = max(heights[-1] for heights in heights_by_puzzle_hash.values())
+        changes: Dict[bytes32, Dict[int, int]] = {puzzle_hash: {} for puzzle_hash in heights_by_puzzle_hash}
+        # Read raw amounts: SQL SUM would overflow signed integers for uint64 coins.
+        async with self.db_wrapper.reader() as conn:
+            for batch in to_batches(list(heights_by_puzzle_hash), self.db_wrapper.host_parameter_limit - 2):
+                placeholders = ",".join("?" for _ in batch.entries)
+                query = (
+                    "SELECT puzzle_hash, confirmed_index, spent_index, amount "
+                    "FROM coin_record INDEXED BY coin_puzzle_hash "
+                    f"WHERE puzzle_hash IN ({placeholders}) AND confirmed_index < ? "
+                    "AND (spent_index=0 OR spent_index>=?)"
+                )
+                async with conn.execute(query, (*batch.entries, end_height, start_height)) as cursor:
+                    for puzzle_hash, confirmed, spent, amount_blob in await cursor.fetchall():
+                        events = changes[bytes32(puzzle_hash)]
+                        amount = int(uint64.from_bytes(amount_blob))
+                        events[confirmed] = events.get(confirmed, 0) + amount
+                        if spent != 0:
+                            events[spent] = events.get(spent, 0) - amount
+
+        result: Dict[bytes32, Dict[uint32, uint64]] = {}
+        for puzzle_hash, heights in heights_by_puzzle_hash.items():
+            events = sorted(changes[puzzle_hash].items())
+            index, balance = 0, 0
+            snapshots: Dict[uint32, uint64] = {}
+            for height in heights:
+                while index < len(events) and events[index][0] < height:
+                    balance += events[index][1]
+                    index += 1
+                snapshots[height] = uint64(balance)
+            result[puzzle_hash] = snapshots
+        return result
+
     async def get_coin_records_by_puzzle_hash_limit(
         self,
         include_spent_coins: bool,

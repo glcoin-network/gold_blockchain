@@ -156,6 +156,12 @@ class FullNode:
     _transaction_queue_task: Optional[asyncio.Task[None]] = None
     simulator_transaction_callback: Optional[Callable[[bytes32], Awaitable[None]]] = None
     _sync_task: Optional[asyncio.Task[None]] = None
+    _sync_retry_task: Optional[asyncio.Task[None]] = None
+    _sync_retry_peaks: Dict[bytes32, full_node_protocol.NewPeak] = dataclasses.field(default_factory=dict)
+    _sync_retry_last_attempt: Dict[bytes32, float] = dataclasses.field(default_factory=dict)
+    _sync_retry_peak_hash: Optional[bytes32] = None
+    _sync_retry_last_progress: float = dataclasses.field(default_factory=time.monotonic)
+    _sync_retry_last_refresh: float = 0
     _candidate_refresh_task: Optional[asyncio.Task[None]] = None
     _candidate_refresh_generation: int = 0
     _transaction_queue: Optional[TransactionQueue] = None
@@ -168,6 +174,7 @@ class FullNode:
     _coin_store: Optional[CoinStore] = None
     _mempool_manager: Optional[MempoolManager] = None
     _init_weight_proof: Optional[asyncio.Task[None]] = None
+    weight_proof_init_error: Optional[str] = None
     _blockchain: Optional[Blockchain] = None
     _timelord_lock: Optional[asyncio.Lock] = None
     weight_proof_handler: Optional[WeightProofHandler] = None
@@ -354,10 +361,15 @@ class FullNode:
             self.initialized = True
             if self.full_node_peers is not None:
                 asyncio.create_task(self.full_node_peers.start())
+            self._sync_retry_task = asyncio.create_task(self._sync_retry_loop())
             try:
                 yield
             finally:
                 self._shut_down = True
+                cancel_task_safe(task=self._sync_retry_task, log=self.log)
+                if self._sync_retry_task is not None:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await self._sync_retry_task
                 if self._init_weight_proof is not None:
                     self._init_weight_proof.cancel()
 
@@ -508,14 +520,22 @@ class FullNode:
             asyncio.create_task(self._handle_one_transaction(item))
 
     async def initialize_weight_proof(self) -> None:
-        self.weight_proof_handler = WeightProofHandler(
-            constants=self.constants,
-            blockchain=self.blockchain,
-            multiprocessing_context=self.multiprocessing_context,
-        )
-        peak = self.blockchain.get_peak()
-        if peak is not None:
-            await self.weight_proof_handler.create_sub_epoch_segments()
+        try:
+            self.weight_proof_handler = WeightProofHandler(
+                constants=self.constants,
+                blockchain=self.blockchain,
+                multiprocessing_context=self.multiprocessing_context,
+            )
+            # Missing segments are generated and persisted on demand.
+            self.weight_proof_init_error = None
+            self.log.info("Weight proof service is ready")
+        except asyncio.CancelledError:
+            self.log.warning("Weight proof initialization was cancelled")
+            raise
+        except Exception as error:
+            self.weight_proof_init_error = f"{type(error).__name__}: {error}"
+            self.log.exception("Weight proof initialization failed")
+            raise
 
     def set_server(self, server: GoldServer) -> None:
         self._server = server
@@ -576,41 +596,41 @@ class FullNode:
             return True  # Don't trigger a long sync
         self.sync_store.batch_syncing.add(peer.peer_node_id)
 
-        self.log.info(f"Starting batch short sync from {start_height} to height {target_height}")
-        if start_height > 0:
-            first = await peer.call_api(
-                FullNodeAPI.request_block, full_node_protocol.RequestBlock(uint32(start_height), False)
-            )
-            if first is None or not isinstance(first, full_node_protocol.RespondBlock):
-                self.sync_store.batch_syncing.remove(peer.peer_node_id)
-                self.log.error(f"Error short batch syncing, could not fetch block at height {start_height}")
-                return False
-            if not self.blockchain.contains_block(first.block.prev_header_hash):
-                self.log.info("Batch syncing stopped, this is a deep chain")
-                self.sync_store.batch_syncing.remove(peer.peer_node_id)
-                # First sb not connected to our blockchain, do a long sync instead
-                return False
-
-        batch_size = self.constants.MAX_BLOCK_COUNT_PER_REQUESTS
-        if self._segment_task is not None and (not self._segment_task.done()):
-            try:
-                self._segment_task.cancel()
-            except Exception as e:
-                self.log.warning(f"failed to cancel segment task {e}")
-            self._segment_task = None
-
+        sync_started = False
         try:
+            self.log.info(f"Starting batch short sync from {start_height} to height {target_height}")
+            if start_height > 0:
+                first = await peer.call_api(
+                    FullNodeAPI.request_block, full_node_protocol.RequestBlock(uint32(start_height), False)
+                )
+                if first is None or not isinstance(first, full_node_protocol.RespondBlock):
+                    self.log.error(f"Error short batch syncing, could not fetch block at height {start_height}")
+                    return False
+                if not self.blockchain.contains_block(first.block.prev_header_hash):
+                    self.log.info("Batch syncing stopped, this is a deep chain")
+                    # First sb not connected to our blockchain, do a long sync instead.
+                    return False
+
+            batch_size = max(1, int(self.constants.MAX_BLOCK_COUNT_PER_REQUESTS))
+            if self._segment_task is not None and (not self._segment_task.done()):
+                try:
+                    self._segment_task.cancel()
+                except Exception as e:
+                    self.log.warning(f"failed to cancel segment task {e}")
+                self._segment_task = None
+
             peer_info = peer.get_peer_logging()
             self.sync_store.set_sync_mode(True)
-            for height in range(start_height, target_height, batch_size):
-                end_height = min(target_height, height + batch_size)
-                request = RequestBlocks(uint32(height), uint32(end_height), True)
-                response = await peer.call_api(FullNodeAPI.request_blocks, request)
-                if not response:
-                    raise ValueError(f"Error short batch syncing, invalid/no response for {height}-{end_height}")
+            sync_started = True
+            for height in range(start_height, target_height + 1, batch_size):
+                end_height = min(target_height, height + batch_size - 1)
+                blocks = await self._fetch_sync_blocks(peer, uint32(height), uint32(end_height))
+                if blocks is None:
+                    self.log.warning(f"Sync peer could not supply blocks {height}-{end_height}; trying another sync path")
+                    return False
                 async with self.blockchain.priority_mutex.acquire(priority=BlockchainMutexPriority.high):
                     state_change_summary: Optional[StateChangeSummary]
-                    success, state_change_summary, _ = await self.add_block_batch(response.blocks, peer_info, None)
+                    success, state_change_summary, _ = await self.add_block_batch(blocks, peer_info, None)
                     if not success:
                         raise ValueError(f"Error short batch syncing, failed to validate blocks {height}-{end_height}")
                     if state_change_summary is not None:
@@ -631,13 +651,48 @@ class FullNode:
                             raise
                         finally:
                             self.log.info(f"Added blocks {height}-{end_height}")
-        except (asyncio.CancelledError, Exception):
-            self.sync_store.batch_syncing.remove(peer.peer_node_id)
-            self.sync_store.set_sync_mode(False)
-            raise
-        self.sync_store.batch_syncing.remove(peer.peer_node_id)
-        self.sync_store.set_sync_mode(False)
+        finally:
+            self.sync_store.batch_syncing.discard(peer.peer_node_id)
+            if sync_started:
+                self.sync_store.set_sync_mode(False)
         return True
+
+    async def _fetch_sync_blocks(
+            self, peer: WSGoldConnection, start_height: uint32, end_height: uint32
+    ) -> Optional[List[FullBlock]]:
+        budget = max(1, float(self.config.get("sync_peer_download_timeout", 120)))
+        deadline = time.monotonic() + budget
+        request = RequestBlocks(start_height, end_height, True)
+        response = await peer.call_api(
+            FullNodeAPI.request_blocks, request, timeout=max(1, min(60, int(budget)))
+        )
+        if isinstance(response, RespondBlocks):
+            if (
+                response.start_height != start_height
+                or response.end_height != end_height
+                or len(response.blocks) != end_height - start_height + 1
+                or any(block.height != start_height + offset for offset, block in enumerate(response.blocks))
+            ):
+                raise ValueError(f"Malformed sync response for {start_height}-{end_height}")
+            return response.blocks
+        if response is not None and not isinstance(response, full_node_protocol.RejectBlocks):
+            raise ValueError(f"Unexpected sync response for {start_height}-{end_height}: {type(response)}")
+        self.log.warning(f"Batch unavailable for {start_height}-{end_height}; requesting individual blocks")
+        blocks: List[FullBlock] = []
+        for height in range(start_height, end_height + 1):
+            remaining = deadline - time.monotonic()
+            if peer.closed or remaining <= 0:
+                return None
+            block_response = await peer.call_api(
+                FullNodeAPI.request_block, full_node_protocol.RequestBlock(uint32(height), True),
+                timeout=max(1, min(60, int(remaining))),
+            )
+            if block_response is None or isinstance(block_response, full_node_protocol.RejectBlock):
+                return None
+            if not isinstance(block_response, RespondBlock) or block_response.block.height != height:
+                raise ValueError(f"Malformed individual sync response at {height}")
+            blocks.append(block_response.block)
+        return blocks
 
     async def short_sync_backtrack(
             self, peer: WSGoldConnection, peak_height: uint32, target_height: uint32, target_unf_hash: bytes32
@@ -709,6 +764,8 @@ class FullNode:
 
         """
 
+        self._sync_retry_peaks[peer.peer_node_id] = request
+        self._sync_retry_last_attempt[peer.peer_node_id] = time.monotonic()
         try:
             seen_header_hash = self.sync_store.seen_header_hash(request.header_hash)
             # Updates heights in the UI. Sleeps 1.5s before, so other peers have time to update their peaks as well.
@@ -744,7 +801,12 @@ class FullNode:
                         full_node_protocol.RequestBlock(target_peak.height, False),
                         timeout=10,
                     )
-                    if target_peak_response is not None and isinstance(target_peak_response, RespondBlock):
+                    if (
+                        isinstance(target_peak_response, RespondBlock)
+                        and target_peak_response.block.header_hash == target_peak.header_hash
+                        and target_peak_response.block.height == target_peak.height
+                        and target_peak_response.block.weight == target_peak.weight
+                    ):
                         self.sync_store.peer_has_block(
                             target_peak.header_hash,
                             peer.peer_node_id,
@@ -766,8 +828,8 @@ class FullNode:
             if request.height < self.constants.WEIGHT_PROOF_RECENT_BLOCKS:
                 # This is the case of syncing up more than a few blocks, at the start of the chain
                 self.log.debug("Doing batch sync, no backup")
-                await self.short_sync_batch(peer, uint32(0), request.height)
-                return None
+                if await self.short_sync_batch(peer, uint32(0), request.height):
+                    return None
 
             if (
                     curr_peak_height <= request.height
@@ -780,7 +842,92 @@ class FullNode:
 
             # This is the either the case where we were not able to sync successfully (for example, due to the fork
             # point being in the past), or we are very far behind. Performs a long sync.
-            self._sync_task = asyncio.create_task(self._sync())
+            if self._sync_task is None or self._sync_task.done():
+                self._sync_task = asyncio.create_task(self._sync())
+
+    async def _sync_retry_loop(self) -> None:
+        while not self._shut_down:
+            await asyncio.sleep(30)
+            try:
+                await self._retry_sync()
+            except Exception:
+                self.log.exception("Automatic sync retry failed; will retry")
+
+    def _sync_in_progress(self) -> bool:
+        return (
+            (self._sync_task is not None and not self._sync_task.done())
+            or bool(self.sync_store.batch_syncing)
+            or any(count > 0 for count in self.sync_store._backtrack_syncing.values())
+        )
+
+    async def _retry_sync(self) -> None:
+        if self._shut_down or not self.initialized or self._server is None:
+            return
+        peak = self.blockchain.get_peak()
+        now = time.monotonic()
+        peak_hash = None if peak is None else peak.header_hash
+        if peak_hash != self._sync_retry_peak_hash:
+            self._sync_retry_peak_hash = peak_hash
+            self._sync_retry_last_progress = now
+        if self._sync_in_progress():
+            return
+        # A completed/failed task must not leave notifications permanently disabled.
+        if self.sync_store.get_sync_mode() or self.sync_store.get_long_sync():
+            self.log.warning("Clearing sync flags left by a completed sync task")
+            self.sync_store.set_sync_mode(False)
+            self.sync_store.set_long_sync(False)
+            self._state_changed("sync_mode")
+        candidates = []
+        for peer in self.server.get_connections(NodeType.FULL_NODE):
+            request = self._sync_retry_peaks.get(peer.peer_node_id)
+            if (
+                peer.closed
+                or request is None
+                or (peak is not None and request.weight <= peak.weight)
+                or self.blockchain.contains_block(request.header_hash)
+                or now - self._sync_retry_last_attempt.get(peer.peer_node_id, 0) < 30
+            ):
+                continue
+            candidates.append((peer, request))
+        if not candidates:
+            await self._refresh_stalled_sync_peers(now)
+            return
+        peer, request = min(
+            candidates, key=lambda item: self._sync_retry_last_attempt.get(item[0].peer_node_id, 0)
+        )
+        async with self.new_peak_sem.acquire():
+            if self._shut_down or self._sync_in_progress() or peer.closed:
+                return
+            self.log.warning(
+                "Retrying announced peak at height %s from %s without waiting for another notification",
+                request.height, peer.get_peer_logging(),
+            )
+            await self.new_peak(request, peer)
+
+    async def _refresh_stalled_sync_peers(self, now: float) -> None:
+        discovery = self.full_node_peers
+        if (
+            discovery is None
+            or not discovery.bootstrap_enabled
+            or discovery.target_outbound_count <= 0
+            or discovery._num_needed_peers() > 0
+            or now - max(self._sync_retry_last_progress, self._sync_retry_last_refresh) < 300
+        ):
+            return
+        # Keep the remaining connections and all local services while replacing one old route.
+        candidates = [
+            peer for peer in self.server.get_connections(NodeType.FULL_NODE, outbound=True)
+            if not peer.closed and not peer.peer_info.ip.is_private
+        ]
+        if not candidates:
+            return
+        peer = min(candidates, key=lambda item: item.creation_time)
+        self._sync_retry_last_refresh = now
+        self.log.warning(
+            "No local peak progress for 300 seconds; refreshing discovery by replacing outbound peer %s",
+            peer.get_peer_logging(),
+        )
+        await peer.close()
 
     async def send_peak_to_timelords(
             self, peak_block: Optional[FullBlock] = None, peer: Optional[WSGoldConnection] = None
@@ -1058,6 +1205,8 @@ class FullNode:
         self._state_changed("sync_mode")
         if self.sync_store is not None:
             self.sync_store.peer_disconnected(connection.peer_node_id)
+        self._sync_retry_peaks.pop(connection.peer_node_id, None)
+        self._sync_retry_last_attempt.pop(connection.peer_node_id, None)
         # Remove all ph | coin id subscription for this peer
         self.subscriptions.remove_peer(connection.peer_node_id)
 
@@ -1123,7 +1272,12 @@ class FullNode:
                     )
                 )
             for i, target_peak_response in enumerate(await asyncio.gather(*coroutines)):
-                if target_peak_response is not None and isinstance(target_peak_response, RespondBlock):
+                if (
+                    isinstance(target_peak_response, RespondBlock)
+                    and target_peak_response.block.header_hash == target_peak.header_hash
+                    and target_peak_response.block.height == target_peak.height
+                    and target_peak_response.block.weight == target_peak.weight
+                ):
                     self.sync_store.peer_has_block(
                         target_peak.header_hash, peers[i].peer_node_id, target_peak.weight, target_peak.height, False
                     )
@@ -1151,12 +1305,7 @@ class FullNode:
         if self.weight_proof_handler is None:
             raise RuntimeError("Weight proof handler is None")
         peers_with_peak = self.get_peers_with_peak(peak_header_hash)
-        # Request weight proof from a random peer
         self.log.info(f"Total of {len(peers_with_peak)} peers with peak {peak_height}")
-        weight_proof_peer: WSGoldConnection = random.choice(peers_with_peak)
-        self.log.info(
-            f"Requesting weight proof from peer {weight_proof_peer.peer_info.host} up to height {peak_height}"
-        )
         cur_peak: Optional[BlockRecord] = self.blockchain.get_peak()
         if cur_peak is not None and peak_weight <= cur_peak.weight:
             raise ValueError("Not performing sync, already caught up.")
@@ -1165,39 +1314,62 @@ class FullNode:
             wp_timeout = self.config["weight_proof_timeout"]
         self.log.debug(f"weight proof timeout is {wp_timeout} sec")
         request = full_node_protocol.RequestProofOfWeight(peak_height, peak_header_hash)
-        response = await weight_proof_peer.call_api(FullNodeAPI.request_proof_of_weight, request, timeout=wp_timeout)
-        # Disconnect from this peer, because they have not behaved properly
-        if response is None or not isinstance(response, full_node_protocol.RespondProofOfWeight):
-            await weight_proof_peer.close(600)
-            raise RuntimeError(f"Weight proof did not arrive in time from peer: {weight_proof_peer.peer_info.host}")
-        if response.wp.recent_chain_data[-1].reward_chain_block.height != peak_height:
-            await weight_proof_peer.close(600)
-            raise RuntimeError(f"Weight proof had the wrong height: {weight_proof_peer.peer_info.host}")
-        if response.wp.recent_chain_data[-1].reward_chain_block.weight != peak_weight:
-            await weight_proof_peer.close(600)
-            raise RuntimeError(f"Weight proof had the wrong weight: {weight_proof_peer.peer_info.host}")
-        if self.in_bad_peak_cache(response.wp):
-            raise ValueError("Weight proof failed bad peak cache validation")
-        # dont sync to wp if local peak is heavier,
-        # dont ban peer, we asked for this peak
-        current_peak = self.blockchain.get_peak()
-        if current_peak is not None:
-            if response.wp.recent_chain_data[-1].reward_chain_block.weight <= current_peak.weight:
-                raise RuntimeError(
-                    f"current peak is heavier than Weight proof peek: {weight_proof_peer.peer_info.host}"
+        last_error: Optional[Exception] = None
+
+        # A single unavailable proof must not abort a sync when several peers
+        # announced the same peak. This is especially important during
+        # rolling upgrades, when older nodes may not be ready to serve proofs.
+        for weight_proof_peer in random.sample(peers_with_peak, len(peers_with_peak)):
+            if weight_proof_peer.closed:
+                continue
+            peer_host = weight_proof_peer.peer_info.host
+            self.log.info(f"Requesting weight proof from peer {peer_host} up to height {peak_height}")
+            try:
+                response = await weight_proof_peer.call_api(
+                    FullNodeAPI.request_proof_of_weight, request, timeout=wp_timeout
                 )
-        try:
-            validated, fork_point, summaries = await self.weight_proof_handler.validate_weight_proof(response.wp)
-        except Exception as e:
-            await weight_proof_peer.close(600)
-            raise ValueError(f"Weight proof validation threw an error {e}")
-        if not validated:
-            await weight_proof_peer.close(600)
-            raise ValueError("Weight proof validation failed")
-        self.log.info(f"Re-checked peers: total of {len(peers_with_peak)} peers with peak {peak_height}")
-        self.sync_store.set_sync_mode(True)
-        self._state_changed("sync_mode")
-        return fork_point, summaries
+                if response is None or not isinstance(response, full_node_protocol.RespondProofOfWeight):
+                    await weight_proof_peer.close()
+                    raise RuntimeError(f"weight proof did not arrive from peer: {peer_host}")
+                if not response.wp.recent_chain_data:
+                    await weight_proof_peer.close(600)
+                    raise ValueError(f"weight proof has no recent chain data: {peer_host}")
+                if response.wp.recent_chain_data[-1].reward_chain_block.height != peak_height:
+                    await weight_proof_peer.close(600)
+                    raise RuntimeError(f"weight proof had the wrong height: {peer_host}")
+                if response.wp.recent_chain_data[-1].reward_chain_block.weight != peak_weight:
+                    await weight_proof_peer.close(600)
+                    raise RuntimeError(f"weight proof had the wrong weight: {peer_host}")
+                if response.wp.recent_chain_data[-1].header_hash != peak_header_hash:
+                    await weight_proof_peer.close(600)
+                    raise ValueError(f"weight proof had the wrong peak hash: {peer_host}")
+                if self.in_bad_peak_cache(response.wp):
+                    raise ValueError("weight proof failed bad peak cache validation")
+
+                current_peak = self.blockchain.get_peak()
+                if current_peak is not None:
+                    if response.wp.recent_chain_data[-1].reward_chain_block.weight <= current_peak.weight:
+                        raise RuntimeError(f"current peak is heavier than weight proof peak: {peer_host}")
+                try:
+                    validated, fork_point, summaries = await self.weight_proof_handler.validate_weight_proof(response.wp)
+                except (ValueError, IndexError):
+                    await weight_proof_peer.close(600)
+                    raise
+                if not validated:
+                    await weight_proof_peer.close(600)
+                    raise ValueError(f"weight proof validation failed: {peer_host}")
+                self.log.info(f"Re-checked peers: total of {len(peers_with_peak)} peers with peak {peak_height}")
+                self.sync_store.set_sync_mode(True)
+                self._state_changed("sync_mode")
+                return fork_point, summaries
+            except Exception as error:
+                last_error = error
+                self.log.warning("Weight proof attempt failed via %s: %s", peer_host, error)
+                continue
+
+        raise RuntimeError(
+            f"no peer could provide a valid weight proof for height {peak_height}: {last_error}"
+        )
 
     async def sync_from_fork_point(
             self,
@@ -1223,6 +1395,7 @@ class FullNode:
         ) -> None:
             start_height, end_height = 0, 0
             new_peers_with_peak: List[WSGoldConnection] = peers_with_peak[:]
+            cancelled = False
             try:
                 # block request ranges are *inclusive*, this requires some
                 # gymnastics of this range (+1 to make it exclusive, like normal
@@ -1234,11 +1407,14 @@ class FullNode:
                     for peer in random.sample(new_peers_with_peak, len(new_peers_with_peak)):
                         if peer.closed:
                             continue
-                        response = await peer.call_api(FullNodeAPI.request_blocks, request, timeout=30)
-                        if response is None:
-                            await peer.close()
-                        elif isinstance(response, RespondBlocks):
-                            await batch_queue.put((peer, response.blocks))
+                        try:
+                            blocks = await self._fetch_sync_blocks(peer, request.start_height, request.end_height)
+                        except ValueError:
+                            self.log.exception("Invalid block response from %s", peer.get_peer_logging())
+                            await peer.close(600)
+                            continue
+                        if blocks is not None:
+                            await batch_queue.put((peer, blocks))
                             fetched = True
                             break
                     if fetched is False:
@@ -1247,11 +1423,15 @@ class FullNode:
                     if self.sync_store.peers_changed.is_set():
                         new_peers_with_peak = self.get_peers_with_peak(peak_hash)
                         self.sync_store.peers_changed.clear()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
             except Exception as e:
                 self.log.error(f"Exception fetching {start_height} to {end_height} from peer {e}")
             finally:
                 # finished signal with None
-                await batch_queue.put(None)
+                if not cancelled:
+                    await batch_queue.put(None)
 
         async def validate_block_batches(
                 inner_batch_queue: asyncio.Queue[Optional[Tuple[WSGoldConnection, List[FullBlock]]]]
@@ -1324,9 +1504,11 @@ class FullNode:
         try:
             with log_exceptions(log=self.log, message="sync from fork point failed"):
                 await asyncio.gather(fetch_task, validate_task)
-        except Exception:
-            assert validate_task.done()
-            fetch_task.cancel()  # no need to cancel validate_task, if we end up here validate_task is already done
+        finally:
+            for task in (fetch_task, validate_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(fetch_task, validate_task, return_exceptions=True)
 
     def get_peers_with_peak(self, peak_hash: bytes32) -> List[WSGoldConnection]:
         peer_ids: Set[bytes32] = self.sync_store.get_peers_that_have_peak([peak_hash])

@@ -26,6 +26,7 @@ class PeerRequestCache:
     def __init__(self) -> None:
         self._blocks = LRUCache(100)
         self._block_requests = LRUCache(300)
+        self.block_requests_semaphore = asyncio.Semaphore(4)
         self._states_validated = LRUCache(1000)
         self._timestamps = LRUCache(1000)
         self._blocks_validated = LRUCache(1000)
@@ -44,7 +45,11 @@ class PeerRequestCache:
                 self._timestamps.put(header_block.height, header_block.foliage_transaction_block.timestamp)
 
     def get_block_request(self, start: uint32, end: uint32) -> Optional[asyncio.Task[Any]]:
-        return self._block_requests.get((start, end))
+        task = self._block_requests.get((start, end))
+        if task is not None and task.done():
+            if task.cancelled() or task.exception() is not None or task.result() is None:
+                return None
+        return task
 
     def add_to_block_requests(self, start: uint32, end: uint32, request: asyncio.Task[Any]) -> None:
         self._block_requests.put((start, end), request)

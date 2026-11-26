@@ -300,7 +300,19 @@ async def fetch_header_blocks_in_range(
     peer_request_cache: PeerRequestCache,
     all_peers: List[Tuple[WSGoldConnection, bool]],
 ) -> Optional[List[HeaderBlock]]:
-    blocks: List[HeaderBlock] = []
+    requests: List[Tuple[uint32, uint32, asyncio.Task[Any]]] = []
+
+    async def fetch(request_start: uint32, request_end: uint32) -> Optional[
+        Union[RespondHeaderBlocks, RespondBlockHeaders]
+    ]:
+        async with peer_request_cache.block_requests_semaphore:
+            response = await _fetch_header_blocks_inner(all_peers, request_start, request_end)
+            if response is not None and [block.height for block in response.header_blocks] != list(
+                range(request_start, request_end + 1)
+            ):
+                raise PeerRequestException(f"Incomplete header range: {request_start}-{request_end}")
+            return response
+
     for i in range(start - (start % 32), end + 1, 32):
         request_start = min(uint32(i), end)
         request_end = min(uint32(i + 31), end)
@@ -309,20 +321,23 @@ async def fetch_header_blocks_in_range(
         )
 
         if res_h_blocks_task is not None:
-            log.debug(f"Using cache for: {start}-{end}")
-            if res_h_blocks_task.done():
-                res_h_blocks: Optional[Union[RespondBlockHeaders, RespondHeaderBlocks]] = res_h_blocks_task.result()
-            else:
-                res_h_blocks = await res_h_blocks_task
+            log.debug(f"Using cache for: {request_start}-{request_end}")
         else:
-            log.debug(f"Fetching: {start}-{end}")
-            res_h_blocks_task = asyncio.create_task(_fetch_header_blocks_inner(all_peers, request_start, request_end))
+            log.debug(f"Fetching: {request_start}-{request_end}")
+            res_h_blocks_task = asyncio.create_task(fetch(request_start, request_end))
             peer_request_cache.add_to_block_requests(request_start, request_end, res_h_blocks_task)
-            res_h_blocks = await res_h_blocks_task
-        if res_h_blocks is None:
+        requests.append((request_start, request_end, res_h_blocks_task))
+
+    # Requests are shared between validators. Cancelling one caller must not cancel
+    # another caller's download or leave a cancelled task cached for the next sync.
+    responses = await asyncio.gather(*(asyncio.shield(task) for _, _, task in requests), return_exceptions=True)
+    blocks: List[HeaderBlock] = []
+    for (request_start, request_end, _), response in zip(requests, responses):
+        if isinstance(response, BaseException):
+            raise response
+        if response is None:
             return None
-        assert res_h_blocks is not None
-        blocks.extend([bl for bl in res_h_blocks.header_blocks if bl.height >= start])
+        blocks.extend(block for block in response.header_blocks if block.height >= start)
     return blocks
 
 

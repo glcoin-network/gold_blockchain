@@ -50,6 +50,7 @@ from chia.types.coin_record import CoinRecord
 from chia.types.coin_spend import CoinSpend, compute_additions
 from chia.types.mempool_inclusion_status import MempoolInclusionStatus
 from chia.types.spend_bundle import SpendBundle
+from chia.types.weight_proof import WeightProof
 from chia.util.bech32m import encode_puzzle_hash
 from chia.util.condition_tools import conditions_dict_for_solution, pkm_pairs_for_conditions_dict
 from chia.util.db_synchronous import db_synchronous_on
@@ -167,7 +168,19 @@ if TYPE_CHECKING:
 PendingTxCallback = Callable[[], None]
 
 
+@dataclasses.dataclass(frozen=True)
+class PreparedCoinStateData:
+    state: CoinState
+    peer_id: bytes32
+    weight_proof: WeightProof
+    children: Tuple[CoinState, ...]
+    created_timestamp: uint64
+    spent_timestamp: uint64
+    spend: Optional[CoinSpend]
+
+
 class WalletStateManager:
+    _history_prefetch_semaphore: Optional[asyncio.Semaphore] = None
     interested_ph_cache: Dict[bytes32, List[int]] = {}
     interested_coin_cache: Dict[bytes32, List[int]] = {}
     constants: ConsensusConstants
@@ -1673,11 +1686,71 @@ class WalletStateManager:
             vc_wallet = await VCWallet.create_new_vc_wallet(self, self.main_wallet)  # pragma: no cover
             return WalletIdentifier(vc_wallet.id(), WalletType.VC)  # pragma: no cover
 
+    async def prepare_coin_state_data(
+        self,
+        coin_states: List[CoinState],
+        peer: WSGoldConnection,
+        fork_height: Optional[uint32],
+    ) -> Dict[bytes32, PreparedCoinStateData]:
+        """Fetch validated standard-wallet history before acquiring the database writer."""
+        weight_proof = self.blockchain.synced_weight_proof
+        if fork_height is not None or weight_proof is None or self.wallet_node.is_trusted(peer):
+            return {}
+        if self._history_prefetch_semaphore is None:
+            self._history_prefetch_semaphore = asyncio.Semaphore(6)
+        semaphore = self._history_prefetch_semaphore
+        trade_coins = await self.trade_manager.get_coins_of_interest()
+
+        async def prepare(state: CoinState) -> Optional[PreparedCoinStateData]:
+            if state.created_height is None or state.spent_height is None or state.coin.name() in trade_coins:
+                return None
+            async with semaphore:
+                if peer.closed or self.wallet_node._shut_down:
+                    return None
+                try:
+                    identifier = await self.puzzle_store.get_wallet_identifier_for_puzzle_hash(state.coin.puzzle_hash)
+                    if identifier is None or identifier.type != WalletType.STANDARD_WALLET:
+                        return None
+                    if await self.coin_store.get_coin_record(state.coin.name()) is not None:
+                        return None
+                    # Validation already fetched these headers from this exact peer.
+                    created_timestamp = await self.wallet_node.get_timestamp_for_height_from_peer(
+                        uint32(state.created_height), peer
+                    )
+                    spent_timestamp = await self.wallet_node.get_timestamp_for_height_from_peer(
+                        uint32(state.spent_height), peer
+                    )
+                    if created_timestamp is None or spent_timestamp is None:
+                        return None
+                    children = await self.wallet_node.fetch_children(state.coin.name(), peer, fork_height)
+                    spend = None
+                    for child in children:
+                        if await self.puzzle_store.get_derivation_record_for_puzzle_hash(child.coin.puzzle_hash) is None:
+                            spend = await fetch_coin_spend_for_coin_state(state, peer)
+                            break
+                    return PreparedCoinStateData(
+                        state,
+                        peer.peer_node_id,
+                        weight_proof,
+                        tuple(children),
+                        created_timestamp,
+                        spent_timestamp,
+                        spend,
+                    )
+                except Exception as error:
+                    # Preserve the original error handling and retry path during application.
+                    self.log.debug("History prefetch unavailable; using normal processing: %s", error)
+                    return None
+
+        prepared = await asyncio.gather(*(prepare(state) for state in coin_states))
+        return {item.state.get_hash(): item for item in prepared if item is not None}
+
     async def _add_coin_states(
         self,
         coin_states: List[CoinState],
         peer: WSGoldConnection,
         fork_height: Optional[uint32],
+        prepared: Optional[Dict[bytes32, PreparedCoinStateData]] = None,
     ) -> None:
         # TODO: add comment about what this method does
         # Input states should already be sorted by cs_height, with reorgs at the beginning
@@ -1743,6 +1816,17 @@ class WalletStateManager:
                     if wallet_identifier is None:
                         self.log.debug(f"No wallet for coin state: {coin_state}")
                         continue
+                    history = None if prepared is None else prepared.get(coin_state.get_hash())
+                    if history is not None and (
+                        history.state != coin_state
+                        or history.peer_id != peer.peer_node_id
+                        or history.weight_proof is not self.blockchain.synced_weight_proof
+                        or fork_height is not None
+                        or wallet_identifier.type != WalletType.STANDARD_WALLET
+                        or coin_name in trade_removals
+                        or local_record is not None
+                    ):
+                        history = None
 
                     # Update the DB to signal that we used puzzle hashes up to this one
                     derivation_index = ph_to_index_cache.get(coin_state.coin.puzzle_hash)
@@ -1776,7 +1860,11 @@ class WalletStateManager:
                     # if the coin has been spent
                     elif coin_state.created_height is not None and coin_state.spent_height is not None:
                         self.log.debug("Coin spent: %s", coin_state)
-                        children = await self.wallet_node.fetch_children(coin_name, peer=peer, fork_height=fork_height)
+                        children = (
+                            list(history.children)
+                            if history is not None
+                            else await self.wallet_node.fetch_children(coin_name, peer=peer, fork_height=fork_height)
+                        )
                         record = local_record
                         if record is None:
                             farmer_reward = False
@@ -1813,8 +1901,12 @@ class WalletStateManager:
                                 change = False
 
                             if not change:
-                                created_timestamp = await self.wallet_node.get_timestamp_for_height(
-                                    uint32(coin_state.created_height)
+                                created_timestamp = (
+                                    history.created_timestamp
+                                    if history is not None
+                                    else await self.wallet_node.get_timestamp_for_height(
+                                        uint32(coin_state.created_height)
+                                    )
                                 )
                                 tx_record = TransactionRecord(
                                     confirmed_at_height=uint32(coin_state.created_height),
@@ -1860,7 +1952,11 @@ class WalletStateManager:
                                         if coin_spend is None:
                                             # To prevent unnecessary fetch, we only fetch once,
                                             # if there is a child coin that is not owned by the wallet.
-                                            coin_spend = await fetch_coin_spend_for_coin_state(coin_state, peer)
+                                            coin_spend = (
+                                                history.spend
+                                                if history is not None and history.spend is not None
+                                                else await fetch_coin_spend_for_coin_state(coin_state, peer)
+                                            )
                                             # Check if the parent coin is a Clawback coin
                                             puzzle: Program = coin_spend.puzzle_reveal.to_program()
                                             solution: Program = coin_spend.solution.to_program()
@@ -1876,8 +1972,12 @@ class WalletStateManager:
                                 if to_puzzle_hash is None:
                                     to_puzzle_hash = additions[0].puzzle_hash
 
-                                spent_timestamp = await self.wallet_node.get_timestamp_for_height(
-                                    uint32(coin_state.spent_height)
+                                spent_timestamp = (
+                                    history.spent_timestamp
+                                    if history is not None
+                                    else await self.wallet_node.get_timestamp_for_height(
+                                        uint32(coin_state.spent_height)
+                                    )
                                 )
 
                                 # Reorg rollback adds reorged transactions so it's possible there is tx_record already
@@ -2091,9 +2191,14 @@ class WalletStateManager:
         coin_states: List[CoinState],
         peer: WSGoldConnection,
         fork_height: Optional[uint32],
+        *,
+        prepared: Optional[Dict[bytes32, PreparedCoinStateData]] = None,
     ) -> bool:
         try:
-            await self._add_coin_states(coin_states, peer, fork_height)
+            if prepared is None:
+                await self._add_coin_states(coin_states, peer, fork_height)
+            else:
+                await self._add_coin_states(coin_states, peer, fork_height, prepared)
         except Exception as e:
             log_level = logging.DEBUG if peer.closed else logging.ERROR
             self.log.log(log_level, f"add_coin_states failed - exception {e}, traceback: {traceback.format_exc()}")

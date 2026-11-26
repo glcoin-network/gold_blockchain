@@ -322,18 +322,19 @@ class WSGoldConnection:
             message = str(int(error.value)).encode("utf-8")
 
         try:
-            if self.inbound_task is not None:
-                self.inbound_task.cancel()
-            if self.incoming_message_task is not None:
-                self.incoming_message_task.cancel()
-            if self.outbound_task is not None:
-                self.outbound_task.cancel()
-            if self.ws is not None and self.ws.closed is False:
-                await self.ws.close(code=ws_close_code, message=message)
-            if self.session is not None:
-                await self.session.close()
+            current_task = asyncio.current_task()
+            for task in (self.inbound_task, self.incoming_message_task, self.outbound_task):
+                if task is not None and task is not current_task:
+                    task.cancel()
+            # Release waiters before network cleanup, which can itself fail or stall.
             self.cancel_pending_requests()
             self.cancel_tasks()
+            try:
+                if self.ws is not None and self.ws.closed is False:
+                    await self.ws.close(code=ws_close_code, message=message)
+            finally:
+                if self.session is not None:
+                    await self.session.close()
         except Exception:
             error_stack = traceback.format_exc()
             self.log.warning(f"Exception closing socket: {error_stack}")
@@ -361,8 +362,9 @@ class WSGoldConnection:
                 self.log.error(f"Failed setting event for {message_id}: {e} {traceback.format_exc()}")
 
     def cancel_tasks(self) -> None:
+        current_task = asyncio.current_task()
         for task_id, task in self.api_tasks.copy().items():
-            if task_id in self.execute_tasks:
+            if task_id in self.execute_tasks or task is current_task:
                 continue
             task.cancel()
 
@@ -388,6 +390,7 @@ class WSGoldConnection:
                 error_stack = traceback.format_exc()
                 self.log.error(f"Exception: {e} with {self.peer_info.host}")
                 self.log.error(f"Exception Stack: {error_stack}")
+            await self.close()
 
     async def _api_call(self, full_message: Message, task_id: bytes32) -> None:
         start_time = time.time()
@@ -521,6 +524,7 @@ class WSGoldConnection:
             error_stack = traceback.format_exc()
             self.log.error(f"Exception: {e}")
             self.log.error(f"Exception Stack: {error_stack}")
+            await self.close()
 
     async def send_message(self, message: Message) -> bool:
         """Send message sends a message with no tracking / callback."""
@@ -594,24 +598,31 @@ class WSGoldConnection:
         message = Message(message_no_id.type, request_id, message_no_id.data)
         assert message.id is not None
         self.pending_requests[message.id] = event
-        await self.outgoing_queue.put(message)
-
         try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            self.log.debug(f"Request timeout: {message}")
-
-        self.pending_requests.pop(message.id)
-        result: Optional[Message] = None
-        if message.id in self.request_results:
-            result = self.request_results[message.id]
-            assert result is not None
-            self.log.debug(
-                f"<- {ProtocolMessageTypes(result.type).name} from: {self.peer_info.host}:{self.peer_info.port}"
-            )
-            self.request_results.pop(message.id)
-
-        return result
+            await self.outgoing_queue.put(message)
+            try:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                self.log.debug(
+                    f"Request timeout: {ProtocolMessageTypes(message.type).name} "
+                    f"id={message.id} peer={self.peer_info.host} timeout={timeout}s"
+                )
+            result: Optional[Message] = self.request_results.pop(message.id, None)
+            if result is not None:
+                self.log.debug(
+                    f"<- {ProtocolMessageTypes(result.type).name} from: {self.peer_info.host}:{self.peer_info.port}"
+                )
+            elif self.closed:
+                self.log.debug(
+                    f"Request interrupted by connection close: {ProtocolMessageTypes(message.type).name} "
+                    f"id={message.id} peer={self.peer_info.host}"
+                )
+            return result
+        finally:
+            # A faster peer can finish first; cancelling this request must not
+            # leave an event or a response registered until nonce reuse.
+            self.pending_requests.pop(message.id, None)
+            self.request_results.pop(message.id, None)
 
     async def _wait_and_retry(self, msg: Message) -> None:
         try:
@@ -622,8 +633,10 @@ class WSGoldConnection:
             return None
 
     async def _send_message(self, message: Message) -> None:
+        started = time.monotonic()
         encoded: bytes = bytes(message)
         size = len(encoded)
+        is_weight_proof = message.type == ProtocolMessageTypes.respond_proof_of_weight.value
         assert len(encoded) < (2 ** (LENGTH_BYTES * 8))
         if not self.outbound_rate_limiter.process_msg_and_check(
             message, self.local_capabilities, self.peer_capabilities
@@ -648,7 +661,25 @@ class WSGoldConnection:
                     f"peer: {self.peer_info.host}"
                 )
 
-        await self.ws.send_bytes(encoded)
+        if is_weight_proof:
+            self.log.info(
+                f"Sending weight proof: peer={self.peer_info.host} id={message.id} bytes={size}"
+            )
+        try:
+            await self.ws.send_bytes(encoded)
+        except Exception:
+            if is_weight_proof:
+                self.log.warning(
+                    f"Weight proof send failed: peer={self.peer_info.host} id={message.id} "
+                    f"bytes={size} elapsed={time.monotonic() - started:.3f}s",
+                    exc_info=True,
+                )
+            raise
+        if is_weight_proof:
+            self.log.info(
+                f"Weight proof sent: peer={self.peer_info.host} id={message.id} "
+                f"bytes={size} elapsed={time.monotonic() - started:.3f}s"
+            )
         self.log.debug(
             f"-> {ProtocolMessageTypes(message.type).name} to peer {self.peer_info.host} {self.peer_node_id}"
         )
@@ -712,7 +743,7 @@ class WSGoldConnection:
             return full_message_loaded
         elif message.type == WSMsgType.ERROR:
             self.log.error(f"WebSocket Error: {message}")
-            if message.data.code == WSCloseCode.MESSAGE_TOO_BIG:
+            if getattr(message.data, "code", None) == WSCloseCode.MESSAGE_TOO_BIG:
                 asyncio.create_task(self.close(300))
             else:
                 asyncio.create_task(self.close())

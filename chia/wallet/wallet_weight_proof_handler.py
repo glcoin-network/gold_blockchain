@@ -45,9 +45,16 @@ class WalletWeightProofHandler:
     async def validate_weight_proof(
         self, weight_proof: WeightProof, skip_segment_validation: bool = False, old_proof: Optional[WeightProof] = None
     ) -> List[BlockRecord]:
-        start_time = time.time()
-        summaries, sub_epoch_weight_list = _validate_sub_epoch_summaries(self._constants, weight_proof)
-        await asyncio.sleep(0)  # break up otherwise multi-second sync code
+        start_time = time.monotonic()
+        # This reads immutable proof data only. Keep lengthy summary hashing and
+        # debug output off the loop that services RPC and WebSocket heartbeats.
+        summaries, sub_epoch_weight_list = await asyncio.get_running_loop().run_in_executor(
+            None, _validate_sub_epoch_summaries, self._constants, weight_proof,
+        )
+        log.info(
+            "weight proof summary validation complete: summaries=%s elapsed=%.3fs",
+            0 if summaries is None else len(summaries), time.monotonic() - start_time,
+        )
         if summaries is None or sub_epoch_weight_list is None:
             raise ValueError("weight proof failed sub epoch data validation")
         validate_from = get_fork_ses_idx(old_proof, weight_proof)
@@ -64,7 +71,11 @@ class WalletWeightProofHandler:
         )
         if not valid:
             raise ValueError("weight proof validation failed")
-        log.info(f"It took {time.time() - start_time} time to validate the weight proof {weight_proof.get_hash()}")
+        log.info(
+            "weight proof validation complete: height=%s records=%s elapsed=%.3fs hash=%s",
+            weight_proof.recent_chain_data[-1].height, len(block_records),
+            time.monotonic() - start_time, weight_proof.get_hash(),
+        )
         return block_records
 
 

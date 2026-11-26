@@ -1154,6 +1154,9 @@ class Blockchain(BlockchainInterface):
         older_block = await self.get_block_record_from_db(older)
         if older_block is None:
             raise ValueError("Older block not found")
+        return self._network_space_from_records(newer_block, older_block)
+
+    def _network_space_from_records(self, newer_block: BlockRecord, older_block: BlockRecord) -> uint128:
         delta_weight = newer_block.weight - older_block.weight
 
         delta_iters = newer_block.total_iters - older_block.total_iters
@@ -1294,6 +1297,12 @@ class Blockchain(BlockchainInterface):
                 curr = previous
         network_space = await self.get_peak_network_space(block_range, peak)
         staking = await self.get_peak_farmer_staking(farmer_public_key, peak, additional_blocks)
+        return self._farmer_difficulty_coeff_from_values(network_space, staking, blocks, peak_height)
+
+    def _farmer_difficulty_coeff_from_values(
+        self, network_space: uint128, staking: uint64, blocks: int, peak_height: Optional[uint32]
+    ) -> Decimal:
+        block_range = self.constants.STAKING_ESTIMATE_BLOCK_RANGE
         minimal_staking = Decimal(str(network_space)) / (block_range * 100)
 
         coeff = Decimal(20)
@@ -1319,3 +1328,121 @@ class Blockchain(BlockchainInterface):
         )
 
         return coeff
+
+    async def get_farmer_difficulty_coeffs(self, headers: List[HeaderBlock]) -> List[Decimal]:
+        """Calculate recent-chain coefficients with one rolling history scan.
+
+        Weight proofs contain hundreds of recent headers. Calling the scalar
+        method for every header repeatedly walks the same staking window.
+        Reuse those counts while retaining the scalar coefficient formula.
+        """
+        if not headers:
+            return []
+
+        block_range = int(self.constants.STAKING_ESTIMATE_BLOCK_RANGE)
+        parent_heights = [int(header.height) - 1 for header in headers]
+        if any(height <= 0 for height in parent_heights):
+            return [
+                await self.get_farmer_difficulty_coeff(
+                    header.reward_chain_block.proof_of_space.farmer_public_key,
+                    uint32(max(0, parent_height)),
+                    parent_hash=header.prev_header_hash,
+                )
+                for header, parent_height in zip(headers, parent_heights)
+            ]
+
+        calculation_started = time.monotonic()
+        first_window_start = max(1, min(parent_heights) - block_range) + 1
+        min_height = first_window_start - 1
+        max_height = max(parent_heights)
+        records = await self.get_block_records_in_range(min_height, max_height)
+        canonical: Dict[int, BlockRecord] = {}
+        for height in range(min_height, max_height + 1):
+            header_hash = self.height_to_hash(uint32(height))
+            if header_hash is not None and header_hash in records:
+                canonical[height] = records[header_hash]
+
+        # The recent chain is contiguous, but keep the scalar path as a
+        # correctness-preserving fallback for incomplete cache/database views.
+        if (
+            len(canonical) != max_height - min_height + 1
+            or any(
+                canonical[height].prev_hash != canonical[height - 1].header_hash
+                for height in range(min_height + 1, max_height + 1)
+            )
+            or any(
+                canonical[height].header_hash != header.prev_header_hash
+                for height, header in zip(parent_heights, headers)
+            )
+        ):
+            log.info(
+                "weight proof coefficient batch fell back to canonical lookups: headers=%s "
+                "height_range=%s-%s reason=incomplete_or_noncanonical_history",
+                len(headers), min_height, max_height,
+            )
+            return [
+                await self.get_farmer_difficulty_coeff(
+                    header.reward_chain_block.proof_of_space.farmer_public_key,
+                    uint32(max(0, parent_height)),
+                    parent_hash=header.prev_header_hash,
+                )
+                for header, parent_height in zip(headers, parent_heights)
+            ]
+
+        sorted_indexes = sorted(range(len(headers)), key=parent_heights.__getitem__)
+        puzzle_hashes = [
+            create_puzzlehash_for_pk(header.reward_chain_block.proof_of_space.farmer_public_key)
+            for header in headers
+        ]
+        heights_by_puzzle_hash: Dict[bytes32, List[uint32]] = {}
+        for puzzle_hash, height in zip(puzzle_hashes, parent_heights):
+            heights_by_puzzle_hash.setdefault(puzzle_hash, []).append(uint32(height))
+        stake_started = time.monotonic()
+        stakes = await self.coin_store.get_unspent_amounts_at_heights(heights_by_puzzle_hash)
+        log.info(
+            "weight proof stake snapshots ready: headers=%s farmers=%s heights=%s elapsed=%.3fs",
+            len(headers), len(heights_by_puzzle_hash),
+            sum(len(heights) for heights in heights_by_puzzle_hash.values()),
+            time.monotonic() - stake_started,
+        )
+        counts: Dict[G1Element, int] = {}
+        window_start = first_window_start
+        window_end = first_window_start - 1
+        result: List[Optional[Decimal]] = [None] * len(headers)
+
+        for index in sorted_indexes:
+            parent_height = parent_heights[index]
+            desired_start = max(parent_height - block_range, 1) + 1
+            while window_end < parent_height:
+                window_end += 1
+                farmer = canonical[window_end].farmer_public_key
+                counts[farmer] = counts.get(farmer, 0) + 1
+            while window_start < desired_start:
+                farmer = canonical[window_start].farmer_public_key
+                counts[farmer] -= 1
+                if counts[farmer] == 0:
+                    del counts[farmer]
+                window_start += 1
+
+            farmer_public_key = headers[index].reward_chain_block.proof_of_space.farmer_public_key
+            blocks = counts.get(farmer_public_key, 0)
+            network_space = (
+                self._network_space_from_records(
+                    canonical[parent_height], canonical[max(1, parent_height - block_range)]
+                )
+                if parent_height > 1 else uint128(0)
+            )
+            result[index] = self._farmer_difficulty_coeff_from_values(
+                network_space, stakes[puzzle_hashes[index]][uint32(parent_height)],
+                blocks, uint32(parent_height),
+            )
+
+        # A reorg can occur while stake queries yield to the event loop.
+        if any(self.height_to_hash(uint32(height)) != record.header_hash for height, record in canonical.items()):
+            raise ValueError("Chain changed while calculating weight proof coefficients")
+        assert all(coefficient is not None for coefficient in result)
+        log.info(
+            "weight proof coefficient batch complete: headers=%s history_heights=%s elapsed=%.3fs",
+            len(headers), len(canonical), time.monotonic() - calculation_started,
+        )
+        return [coefficient for coefficient in result if coefficient is not None]

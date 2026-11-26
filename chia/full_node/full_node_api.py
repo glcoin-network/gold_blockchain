@@ -78,6 +78,37 @@ else:
 
 class FullNodeAPI:
     log: logging.Logger
+
+    async def _wait_for_weight_proof_service(self) -> bool:
+        """Wait for startup proof preparation before rejecting a wallet request."""
+        full_node = self.full_node
+        if full_node.weight_proof_handler is not None:
+            return True
+
+        init_task = full_node._init_weight_proof
+        if init_task is None:
+            self.log.error("weight proof request rejected: initialization task is missing")
+            return False
+
+        timeout = max(1, int(full_node.config.get("weight_proof_init_timeout", 180)))
+        try:
+            await asyncio.wait_for(asyncio.shield(init_task), timeout=timeout)
+        except asyncio.TimeoutError:
+            self.log.warning(
+                "weight proof service is still initializing after %s seconds", timeout
+            )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.log.exception("weight proof service initialization task failed")
+            return False
+
+        if full_node.weight_proof_handler is None:
+            reason = getattr(full_node, "weight_proof_init_error", None)
+            self.log.error("weight proof service is unavailable: %s", reason or "unknown error")
+            return False
+        return True
     full_node: FullNode
     executor: ThreadPoolExecutor
 
@@ -271,26 +302,73 @@ class FullNodeAPI:
 
     @api_request(reply_types=[ProtocolMessageTypes.respond_proof_of_weight])
     async def request_proof_of_weight(self, request: full_node_protocol.RequestProofOfWeight) -> Optional[Message]:
-        if self.full_node.weight_proof_handler is None:
+        if not await self._wait_for_weight_proof_service():
             return None
         if not self.full_node.blockchain.contains_block(request.tip):
             self.log.error(f"got weight proof request for unknown peak {request.tip}")
             return None
-        if request.tip in self.full_node.pow_creation:
-            event = self.full_node.pow_creation[request.tip]
-            await event.wait()
-            wp = await self.full_node.weight_proof_handler.get_proof_of_weight(request.tip)
-        else:
-            event = asyncio.Event()
-            self.full_node.pow_creation[request.tip] = event
-            wp = await self.full_node.weight_proof_handler.get_proof_of_weight(request.tip)
-            event.set()
+
+        store = self.full_node.full_node_store
+        if store.serialized_wp_message_tip == request.tip and store.serialized_wp_message is not None:
+            return store.serialized_wp_message
+
+        retry_count = max(1, int(self.full_node.config.get("weight_proof_request_retries", 3)))
+        retry_delay = max(0.0, float(self.full_node.config.get("weight_proof_retry_delay", 1.0)))
+        wp = None
+        for attempt in range(retry_count):
+            event = self.full_node.pow_creation.get(request.tip)
+            if event is None:
+                event = asyncio.Event()
+                self.full_node.pow_creation[request.tip] = event
+                try:
+                    wp = await self.full_node.weight_proof_handler.get_proof_of_weight(request.tip)
+                except Exception:
+                    # Always release concurrent callers. Without this, one failed
+                    # proof build leaves every later request waiting forever.
+                    self.log.exception(
+                        "exception while creating weight proof for peak %s (attempt %s/%s)",
+                        request.tip,
+                        attempt + 1,
+                        retry_count,
+                    )
+                    wp = None
+                finally:
+                    event.set()
+            else:
+                await event.wait()
+                if store.serialized_wp_message_tip == request.tip and store.serialized_wp_message is not None:
+                    return store.serialized_wp_message
+                try:
+                    wp = await self.full_node.weight_proof_handler.get_proof_of_weight(request.tip)
+                except Exception:
+                    self.log.exception(
+                        "exception while reusing weight proof for peak %s (attempt %s/%s)",
+                        request.tip,
+                        attempt + 1,
+                        retry_count,
+                    )
+                    wp = None
+
+            if wp is not None:
+                break
+            if attempt + 1 < retry_count:
+                self.log.warning(
+                    "weight proof generation returned no proof for peak %s; retrying in %.1fs",
+                    request.tip,
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+
         tips = list(self.full_node.pow_creation.keys())
 
         if len(tips) > 4:
-            # Remove old from cache
-            for i in range(0, 4):
-                self.full_node.pow_creation.pop(tips[i])
+            # Keep in-flight builders registered so concurrent callers still wait.
+            for tip in tips:
+                if len(self.full_node.pow_creation) <= 4:
+                    break
+                pending = self.full_node.pow_creation.get(tip)
+                if pending is not None and pending.is_set():
+                    self.full_node.pow_creation.pop(tip, None)
 
         if wp is None:
             self.log.error(f"failed creating weight proof for peak {request.tip}")

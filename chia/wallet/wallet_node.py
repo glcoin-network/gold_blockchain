@@ -162,6 +162,14 @@ class WalletNode:
     _retry_failed_states_task: Optional[asyncio.Task[None]] = None
     _secondary_peer_sync_task: Optional[asyncio.Task[None]] = None
     _tx_messages_in_progress: Dict[bytes32, List[bytes32]] = dataclasses.field(default_factory=dict)
+    # Throttle unavailable peers without preventing a newly connected peer
+    # from supplying a valid proof for the same peak.
+    _untrusted_peer_retry_at: Dict[bytes32, float] = dataclasses.field(default_factory=dict)
+    _untrusted_sync_retry_task: Optional[asyncio.Task[None]] = None
+    _untrusted_sync_peaks: Dict[bytes32, Tuple[NewPeakWallet, WSGoldConnection]] = dataclasses.field(default_factory=dict)
+    _untrusted_sync_retry_target: Optional[Tuple[NewPeakWallet, WSGoldConnection]] = None
+    _weight_proof_syncing: bool = False
+    _weight_proof_sources: Dict[bytes32, bytes32] = dataclasses.field(default_factory=dict)
 
     @contextlib.asynccontextmanager
     async def manage(self) -> AsyncIterator[None]:
@@ -497,9 +505,18 @@ class WalletNode:
             self._retry_failed_states_task.cancel()
         if self._secondary_peer_sync_task is not None:
             self._secondary_peer_sync_task.cancel()
+        if self._untrusted_sync_retry_task is not None:
+            self._untrusted_sync_retry_task.cancel()
 
     async def _await_closed(self, shutting_down: bool = True) -> None:
         self.log.info("self._await_closed")
+        if self._untrusted_sync_retry_task is not None:
+            await asyncio.gather(self._untrusted_sync_retry_task, return_exceptions=True)
+            self._untrusted_sync_retry_task = None
+        self._untrusted_peer_retry_at.clear()
+        self._untrusted_sync_peaks.clear()
+        self._untrusted_sync_retry_target = None
+        self._weight_proof_sources.clear()
         if self._server is not None:
             await self.server.close_all_connections()
         if self.wallet_peers is not None:
@@ -732,6 +749,14 @@ class WalletNode:
             asyncio.create_task(self.wallet_peers.start())
 
     async def on_disconnect(self, peer: WSGoldConnection) -> None:
+        self._untrusted_peer_retry_at.pop(peer.peer_node_id, None)
+        self._untrusted_sync_peaks.pop(peer.peer_node_id, None)
+        if self._untrusted_sync_retry_target is not None and (
+            self._untrusted_sync_retry_target[1].peer_node_id == peer.peer_node_id
+        ):
+            self._untrusted_sync_retry_target = max(
+                self._untrusted_sync_peaks.values(), key=lambda item: item[0].weight, default=None,
+            )
         if self.is_trusted(peer):
             self.local_node_synced = False
             self.initialize_wallet_peers()
@@ -743,7 +768,8 @@ class WalletNode:
         if peer.peer_node_id in self._tx_messages_in_progress:
             del self._tx_messages_in_progress[peer.peer_node_id]
 
-        self.wallet_state_manager.state_changed("close_connection")
+        if self._wallet_state_manager is not None:
+            self.wallet_state_manager.state_changed("close_connection")
 
     async def on_connect(self, peer: WSGoldConnection) -> None:
         if self._wallet_state_manager is None:
@@ -941,23 +967,51 @@ class WalletNode:
         if num_filtered > 0:
             self.log.info(f"Filtered {num_filtered} spam transactions")
 
+        batch_failed = False
+
         async def validate_and_add(inner_states: List[CoinState], inner_idx_start: int) -> None:
+            nonlocal batch_failed
             try:
                 assert self.validation_semaphore is not None
                 async with self.validation_semaphore:
+                    batch_started = time.monotonic()
                     valid_states = [
                         inner_state
                         for inner_state in inner_states
                         if await self.validate_received_state_from_peer(inner_state, peer, cache, fork_height)
                     ]
                     if len(valid_states) > 0:
+                        prepare_started = time.monotonic()
+                        prepared = await self.wallet_state_manager.prepare_coin_state_data(
+                            valid_states, peer, fork_height
+                        )
+                        writer_wait_started = time.monotonic()
                         async with self.wallet_state_manager.db_wrapper.writer():
+                            apply_started = time.monotonic()
                             self.log.info(
                                 f"new coin state received ({inner_idx_start}-"
                                 f"{inner_idx_start + len(inner_states) - 1}/ {len(updated_coin_states)})"
                             )
-                            await self.wallet_state_manager.add_coin_states(valid_states, peer, fork_height)
+                            applied = await self.wallet_state_manager.add_coin_states(
+                                valid_states, peer, fork_height, prepared=prepared
+                            )
+                        if not applied:
+                            batch_failed = True
+                            self.log.warning("Wallet history batch application failed; sync must be retried")
+                            return
+                        self.log.info(
+                            "Wallet history batch processed: states=%s/%s prepared=%s "
+                            "validation=%.3fs preparation=%.3fs writer_wait=%.3fs application=%.3fs total=%.3fs",
+                            len(valid_states), len(inner_states), len(prepared),
+                            prepare_started - batch_started, writer_wait_started - prepare_started,
+                            apply_started - writer_wait_started, time.monotonic() - apply_started,
+                            time.monotonic() - batch_started,
+                        )
+            except asyncio.CancelledError:
+                batch_failed = True
+                raise
             except Exception as e:
+                batch_failed = True
                 tb = traceback.format_exc()
                 log_level = logging.DEBUG if peer.closed or self._shut_down else logging.ERROR
                 self.log.log(log_level, f"validate_and_add failed - exception: {e}, traceback: {tb}")
@@ -1016,7 +1070,12 @@ class WalletNode:
         still_connected = self._server is not None and peer.peer_node_id in self.server.all_connections
         await asyncio.gather(*all_tasks)
         await self.update_ui()
-        return still_connected and self._server is not None and peer.peer_node_id in self.server.all_connections
+        return (
+            not batch_failed
+            and still_connected
+            and self._server is not None
+            and peer.peer_node_id in self.server.all_connections
+        )
 
     def is_timestamp_in_sync(self, timestamp: uint64) -> bool:
         return self.config.get("testing", False) or uint64(time.time()) - timestamp < 600
@@ -1117,10 +1176,41 @@ class WalletNode:
                 return timestamp
         raise PeerRequestException("Error fetching timestamp from all peers")
 
+    def _record_untrusted_peak(self, new_peak: NewPeakWallet, peer: WSGoldConnection) -> None:
+        if self._shut_down or peer.closed:
+            return
+        previous = self._untrusted_sync_peaks.get(peer.peer_node_id)
+        if previous is None or new_peak.weight >= previous[0].weight:
+            self._untrusted_sync_peaks[peer.peer_node_id] = (new_peak, peer)
+        target = self._untrusted_sync_retry_target
+        if target is None or new_peak.weight >= target[0].weight:
+            self._untrusted_sync_retry_target = (new_peak, peer)
+
     async def new_peak_wallet(self, new_peak: NewPeakWallet, peer: WSGoldConnection) -> None:
+        if self._wallet_state_manager is None or self._shut_down:
+            return
+        trusted = self.is_trusted(peer)
+        if not trusted:
+            self._record_untrusted_peak(new_peak, peer)
+            latest = self._untrusted_sync_peaks.get(peer.peer_node_id)
+            if latest is not None and latest[0].weight >= new_peak.weight:
+                new_peak = latest[0]
+        try:
+            await self._process_new_peak_wallet(new_peak, peer)
+        finally:
+            # Header, timestamp and state failures all need another attempt.
+            # Updating the retry target happens before checking for a timer.
+            if not trusted and not self._shut_down and self._wallet_state_manager is not None:
+                finished = await self.wallet_state_manager.blockchain.get_finished_sync_up_to()
+                if finished < new_peak.height:
+                    self._schedule_untrusted_sync_retry(new_peak, peer)
+
+    async def _process_new_peak_wallet(self, new_peak: NewPeakWallet, peer: WSGoldConnection) -> None:
         if self._wallet_state_manager is None:
             # When logging out of wallet
             self.log.debug("state manager is None (shutdown)")
+            return
+        if peer.closed:
             return
         trusted: bool = self.is_trusted(peer)
         peak_hb: Optional[HeaderBlock] = await self.wallet_state_manager.blockchain.get_peak_block()
@@ -1131,9 +1221,10 @@ class WalletNode:
 
         request = RequestBlockHeader(new_peak.height)
         response: Optional[RespondBlockHeader] = await peer.call_api(FullNodeAPI.request_block_header, request)
-        if response is None:
-            self.log.warning(f"Peer {peer.get_peer_info()} did not respond in time.")
-            await peer.close(120)
+        if not isinstance(response, RespondBlockHeader):
+            self.log.warning(f"Peer {peer.peer_info} did not respond to block header request.")
+            if not peer.closed:
+                await peer.close()
             return
 
         new_peak_hb: HeaderBlock = response.header_block
@@ -1172,6 +1263,38 @@ class WalletNode:
         async with self.wallet_state_manager.lock:
             await self.wallet_state_manager.new_peak(new_peak.height)
 
+    def _schedule_untrusted_sync_retry(self, new_peak: NewPeakWallet, peer: WSGoldConnection) -> None:
+        self._record_untrusted_peak(new_peak, peer)
+        if self._untrusted_sync_retry_target is None:
+            self._untrusted_sync_retry_target = (new_peak, peer)
+        if self._shut_down or (
+            self._untrusted_sync_retry_task is not None and not self._untrusted_sync_retry_task.done()
+        ):
+            return
+
+        async def retry() -> None:
+            while not self._shut_down:
+                await asyncio.sleep(30)
+                if self._shut_down or self._wallet_state_manager is None:
+                    return
+                try:
+                    target = self._untrusted_sync_retry_target
+                    if target is None:
+                        return
+                    target_peak, target_peer = target
+                    if await self.wallet_state_manager.blockchain.get_finished_sync_up_to() >= target_peak.height:
+                        return
+                    candidates = [target_peer] + self.server.get_connections(NodeType.FULL_NODE)
+                    for candidate in candidates:
+                        if not candidate.closed and not self.is_trusted(candidate):
+                            # Coin states and retries still run in the same serial queue.
+                            await self.new_peak_queue.new_peak_wallet(target_peak, candidate)
+                            return
+                except Exception:
+                    self.log.exception("Could not requeue untrusted wallet sync")
+
+        self._untrusted_sync_retry_task = asyncio.create_task(retry())
+
     async def new_peak_from_trusted(
         self, new_peak_hb: HeaderBlock, latest_timestamp: uint64, peer: WSGoldConnection
     ) -> None:
@@ -1186,43 +1309,138 @@ class WalletNode:
     async def new_peak_from_untrusted(
             self, new_peak_hb: HeaderBlock, difficulty_coeff: Decimal, peer: WSGoldConnection
     ) -> bool:
+        now = time.monotonic()
+        for key, deadline in list(self._untrusted_peer_retry_at.items()):
+            if deadline <= now:
+                self._untrusted_peer_retry_at.pop(key, None)
+
         far_behind: bool = (
             new_peak_hb.height - await self.wallet_state_manager.blockchain.get_finished_sync_up_to()
             > self.LONG_SYNC_THRESHOLD
         )
 
-        if new_peak_hb.height < self.constants.WEIGHT_PROOF_RECENT_BLOCKS:
-            # this is the case happens chain is shorter then WEIGHT_PROOF_RECENT_BLOCKS
-            return await self.sync_from_untrusted_close_to_peak(new_peak_hb, difficulty_coeff, peer)
+        # A peer can announce the same peak as several other peers. If its
+        # proof is unavailable, ask the other peers for the same header before
+        # declaring the whole network unavailable.
+        other_peers = [
+            candidate
+            for candidate in self.server.get_connections(NodeType.FULL_NODE)
+            if candidate.peer_node_id != peer.peer_node_id and not candidate.closed and not self.is_trusted(candidate)
+        ]
+        random.shuffle(other_peers)
+        candidates = [peer] + other_peers
+        if not far_behind:
+            # Keep catching up with a subscribed, validated peer before
+            # starting another expensive proof for a new announcer.
+            candidates.sort(key=lambda item: item.peer_node_id not in self.synced_peers)
+        source_id = self._weight_proof_sources.get(new_peak_hb.header_hash)
+        if source_id is not None:
+            source = next((item for item in candidates if item.peer_node_id == source_id), None)
+            if source is None:
+                self._weight_proof_sources.pop(new_peak_hb.header_hash, None)
+            else:
+                candidates.remove(source)
+                candidates.insert(0, source)
+        last_error: Optional[Exception] = None
 
-        if not far_behind and peer.peer_node_id in self.synced_peers:
-            # This is the (untrusted) case where we already synced and are not too far behind. Here we just
-            # fetch one by one.
-            return await self.sync_from_untrusted_close_to_peak(new_peak_hb, difficulty_coeff, peer)
+        for candidate in candidates:
+            if candidate.closed or self._untrusted_peer_retry_at.get(candidate.peer_node_id, 0) > time.monotonic():
+                continue
+            candidate_difficulty = difficulty_coeff
+            if candidate.peer_node_id != peer.peer_node_id:
+                try:
+                    header_response = await candidate.call_api(
+                        FullNodeAPI.request_block_header,
+                        RequestBlockHeader(new_peak_hb.height),
+                        timeout=30,
+                    )
+                except Exception as error:
+                    self.log.debug("Could not query peer %s for announced peak: %s", candidate.peer_info, error)
+                    continue
+                if (
+                    header_response is None
+                    or not isinstance(header_response, RespondBlockHeader)
+                    or header_response.header_block.header_hash != new_peak_hb.header_hash
+                    or header_response.header_block.weight != new_peak_hb.weight
+                    or header_response.header_block.height != new_peak_hb.height
+                ):
+                    continue
+                candidate_difficulty = Decimal(header_response.difficulty_coeff)
 
-        # we haven't synced fully to this peer yet
-        syncing = False
-        if far_behind or len(self.synced_peers) == 0:
-            syncing = True
+            try:
+                if new_peak_hb.height < self.constants.WEIGHT_PROOF_RECENT_BLOCKS:
+                    # Short chains do not need a weight proof.
+                    result = await self.sync_from_untrusted_close_to_peak(
+                        new_peak_hb, candidate_difficulty, candidate
+                    )
+                elif not far_behind and candidate.peer_node_id in self.synced_peers:
+                    result = await self.sync_from_untrusted_close_to_peak(
+                        new_peak_hb, candidate_difficulty, candidate
+                    )
+                    if not result and not candidate.closed:
+                        current_peak = await self.wallet_state_manager.blockchain.get_peak_block()
+                        if current_peak is None or new_peak_hb.weight > current_peak.weight:
+                            self.synced_peers.discard(candidate.peer_node_id)
+                            await self.long_sync_from_untrusted(True, new_peak_hb, candidate)
+                            candidate = self._weight_proof_peer(new_peak_hb, candidate)
+                            result = candidate.peer_node_id in self.synced_peers
+                else:
+                    syncing = far_behind or len(self.synced_peers) == 0
+                    secondary_sync_running = (
+                        self._secondary_peer_sync_task is not None
+                        and self._secondary_peer_sync_task.done() is False
+                    )
+                    if not syncing and secondary_sync_running:
+                        self.log.info("Will not do secondary sync, there is already another sync task running.")
+                        return False
+                    await self.long_sync_from_untrusted(syncing, new_peak_hb, candidate)
+                    candidate = self._weight_proof_peer(new_peak_hb, candidate)
+                    result = not syncing or candidate.peer_node_id in self.synced_peers
+                if result:
+                    self._untrusted_peer_retry_at.pop(candidate.peer_node_id, None)
+                    if candidate.peer_node_id in self.synced_peers:
+                        await self.wallet_state_manager.blockchain.set_finished_sync_up_to(new_peak_hb.height)
+                    return True
+            except Exception as error:
+                last_error = error
+                failed_peer = self._weight_proof_peer(new_peak_hb, candidate)
+                self.log.warning(
+                    "Untrusted sync attempt for peak %s failed via %s: %s",
+                    new_peak_hb.header_hash,
+                    failed_peer.peer_info,
+                    error,
+                )
+                self._untrusted_peer_retry_at[failed_peer.peer_node_id] = time.monotonic() + 30
+                self._weight_proof_sources.pop(new_peak_hb.header_hash, None)
+                # A missing proof can be caused by a peer still initializing
+                # its proof handler. Keep the connection available for later
+                # retry instead of banning every candidate immediately.
+                continue
 
-        secondary_sync_running = (
-            self._secondary_peer_sync_task is not None and self._secondary_peer_sync_task.done() is False
-        )
-        if not syncing and secondary_sync_running:
-            self.log.info("Will not do secondary sync, there is already another sync task running.")
-            return False
+        if last_error is not None:
+            self.log.warning(
+                "No connected peer could sync untrusted peak %s; retrying in 30 seconds",
+                new_peak_hb.header_hash,
+            )
+        return False
 
-        try:
-            await self.long_sync_from_untrusted(syncing, new_peak_hb, peer)
-        except Exception:
-            self.log.exception(f"Error syncing to {peer.get_peer_info()}")
-            await peer.close()
-            return False
-        return True
+    def _weight_proof_peer(self, peak: HeaderBlock, fallback: WSGoldConnection) -> WSGoldConnection:
+        source_id = self._weight_proof_sources.get(peak.header_hash)
+        if source_id is not None:
+            for candidate in self.server.get_connections(NodeType.FULL_NODE):
+                if (
+                    candidate.peer_node_id == source_id and not candidate.closed
+                    and self._untrusted_peer_retry_at.get(source_id, 0) <= time.monotonic()
+                ):
+                    return candidate
+        return fallback
 
     async def long_sync_from_untrusted(self, syncing: bool, new_peak_hb: HeaderBlock, peer: WSGoldConnection) -> None:
         current_height: uint32 = await self.wallet_state_manager.blockchain.get_finished_sync_up_to()
         fork_point_weight_proof = await self.fetch_and_update_weight_proof(peer, new_peak_hb)
+        peer = self._weight_proof_peer(new_peak_hb, peer)
+        if peer.closed:
+            raise RuntimeError("weight proof source disconnected before wallet state sync")
         # This usually happens the first time we start up the wallet. We roll back slightly to be
         # safe, but we don't want to rollback too much (hence 16)
         fork_point_rollback: int = max(0, current_height - 16)
@@ -1232,6 +1450,10 @@ class WalletNode:
         if syncing:
             async with self.wallet_state_manager.set_sync_mode(new_peak_hb.height):
                 await self.long_sync(new_peak_hb.height, peer, fork_point_syncing, rollback=True)
+            # set_sync_mode logs and suppresses exceptions; check completion
+            # here so another peer can resume with the already verified proof.
+            if peer.peer_node_id not in self.synced_peers:
+                raise RuntimeError(f"wallet state sync did not complete with peer {peer.peer_info}")
             return
 
         # we exit earlier in the case where syncing is False and a Secondary sync is running
@@ -1251,7 +1473,14 @@ class WalletNode:
             if peak_hb is None or new_peak_hb.weight > peak_hb.weight:
                 backtrack_fork_height: int = await self.wallet_short_sync_backtrack(new_peak_hb, difficulty_coeff, peer)
             else:
-                backtrack_fork_height = new_peak_hb.height - 1
+                if new_peak_hb.header_hash != peak_hb.header_hash:
+                    return False
+                # A repeated peak can still have late or previously failed
+                # state updates. Apply them before confirming completion.
+                backtrack_fork_height = min(
+                    new_peak_hb.height - 1,
+                    await self.wallet_state_manager.blockchain.get_finished_sync_up_to(),
+                )
             fork_height = max(backtrack_fork_height, 0)
 
             use_delta_sync = self.config.get("use_delta_sync", False)
@@ -1274,11 +1503,8 @@ class WalletNode:
                 )
                 if success:
                     self.synced_peers.add(peer.peer_node_id)
-            else:
-                if peak_hb is not None and new_peak_hb.weight <= peak_hb.weight:
-                    # Don't process blocks at the same weight
+                else:
                     return False
-
             # For every block, we need to apply the cache from race_cache
             for potential_height in range(backtrack_fork_height + 1, new_peak_hb.height + 1):
                 try:
@@ -1287,7 +1513,8 @@ class WalletNode:
                     continue
 
                 self.log.info(f"Apply race cache - height: {potential_height}, coin_states: {race_cache}")
-                await self.add_states_from_peer(list(race_cache), peer)
+                if not await self.add_states_from_peer(list(race_cache), peer):
+                    return False
 
             # Clear old entries that are no longer relevant
             cache.cleanup_race_cache(min_height=backtrack_fork_height)
@@ -1347,31 +1574,117 @@ class WalletNode:
 
     async def fetch_and_update_weight_proof(self, peer: WSGoldConnection, peak: HeaderBlock) -> int:
         assert self._weight_proof_handler is not None
+        old_proof = self.wallet_state_manager.blockchain.synced_weight_proof
+        if old_proof is not None and old_proof.recent_chain_data and (
+            old_proof.recent_chain_data[-1].header_hash == peak.header_hash
+            and old_proof.recent_chain_data[-1].height == peak.height
+            and old_proof.recent_chain_data[-1].weight == peak.weight
+        ):
+            return get_wp_fork_point(self.constants, old_proof, old_proof)
+
         weight_request = RequestProofOfWeight(peak.height, peak.header_hash)
         wp_timeout = self.config.get("weight_proof_timeout", 360)
-        self.log.debug(f"weight proof timeout is {wp_timeout} sec")
-        weight_proof_response: RespondProofOfWeight = await peer.call_api(
-            FullNodeAPI.request_proof_of_weight, weight_request, timeout=wp_timeout
-        )
+        delay = max(0, float(self.config.get("weight_proof_peer_delay", 15)))
+        candidates = [peer]
+        attempted: Set[bytes32] = set()
+        tasks: Dict[asyncio.Task[RespondProofOfWeight], WSGoldConnection] = {}
 
-        if weight_proof_response is None:
-            raise Exception("weight proof response was none")
+        async def request(candidate: WSGoldConnection) -> RespondProofOfWeight:
+            if candidate is not peer:
+                block_response = await candidate.call_api(
+                    FullNodeAPI.request_block_header, RequestBlockHeader(peak.height), timeout=30,
+                )
+                if not isinstance(block_response, RespondBlockHeader) or (
+                    block_response.header_block.height != peak.height
+                    or block_response.header_block.weight != peak.weight
+                    or block_response.header_block.header_hash != peak.header_hash
+                ):
+                    raise RuntimeError(f"peer {candidate.peer_info} does not have the requested proof target")
+            self.log.info("Requesting weight proof at height %s from %s", peak.height, candidate.peer_info)
+            started = time.monotonic()
+            result = await candidate.call_api(
+                FullNodeAPI.request_proof_of_weight, weight_request, timeout=wp_timeout,
+            )
+            if not isinstance(result, RespondProofOfWeight):
+                raise RuntimeError(f"weight proof response was none from {candidate.peer_info}")
+            self.log.info(
+                "Received weight proof at height %s from %s: elapsed=%.3fs summaries=%s recent_headers=%s",
+                peak.height, candidate.peer_info, time.monotonic() - started,
+                len(result.wp.sub_epochs), len(result.wp.recent_chain_data),
+            )
+            return result
 
-        weight_proof = weight_proof_response.wp
+        def start_next() -> None:
+            candidate = candidates.pop(0)
+            attempted.add(candidate.peer_node_id)
+            tasks[asyncio.create_task(request(candidate))] = candidate
 
-        if weight_proof.recent_chain_data[-1].height != peak.height:
-            raise Exception("weight proof height does not match peak")
-        if weight_proof.recent_chain_data[-1].weight != peak.weight:
-            raise Exception("weight proof weight does not match peak")
-        if weight_proof.recent_chain_data[-1].header_hash != peak.header_hash:
-            raise Exception("weight proof peak hash does not match peak")
+        def discover_candidates() -> None:
+            queued = {candidate.peer_node_id for candidate in candidates}
+            for candidate in self.server.get_connections(NodeType.FULL_NODE):
+                if (
+                    candidate.peer_node_id not in attempted and candidate.peer_node_id not in queued
+                    and not candidate.closed and not self.is_trusted(candidate)
+                    and self._untrusted_peer_retry_at.get(candidate.peer_node_id, 0) <= time.monotonic()
+                ):
+                    candidates.append(candidate)
+                    queued.add(candidate.peer_node_id)
 
-        old_proof = self.wallet_state_manager.blockchain.synced_weight_proof
-        block_records = await self._weight_proof_handler.validate_weight_proof(weight_proof, False, old_proof)
-
-        await self.wallet_state_manager.blockchain.new_valid_weight_proof(weight_proof, block_records)
-
-        return get_wp_fork_point(self.constants, old_proof, weight_proof)
+        self._weight_proof_syncing = True
+        last_error: Exception = RuntimeError("no peer could provide a weight proof")
+        try:
+            start_next()
+            while tasks:
+                discover_candidates()
+                can_start = len(tasks) < 3
+                done, _ = await asyncio.wait(
+                    tasks, timeout=delay if can_start else None, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    discover_candidates()
+                    if candidates:
+                        start_next()
+                    continue
+                for task in done:
+                    candidate = tasks.pop(task)
+                    try:
+                        weight_proof = task.result().wp
+                    except Exception as error:
+                        last_error = error
+                        self._untrusted_peer_retry_at[candidate.peer_node_id] = time.monotonic() + 30
+                        self.log.warning("Weight proof unavailable from %s: %s", candidate.peer_info, error)
+                        continue
+                    try:
+                        if not weight_proof.recent_chain_data:
+                            raise ValueError("weight proof has no recent chain data")
+                        if weight_proof.recent_chain_data[-1].height != peak.height:
+                            raise ValueError("weight proof height does not match peak")
+                        if weight_proof.recent_chain_data[-1].weight != peak.weight:
+                            raise ValueError("weight proof weight does not match peak")
+                        if weight_proof.recent_chain_data[-1].header_hash != peak.header_hash:
+                            raise ValueError("weight proof peak hash does not match peak")
+                        block_records = await self._weight_proof_handler.validate_weight_proof(
+                            weight_proof, False, old_proof,
+                        )
+                    except (ValueError, IndexError) as error:
+                        last_error = error
+                        await candidate.close(600)
+                        self.log.warning("Rejected invalid weight proof from %s: %s", candidate.peer_info, error)
+                        continue
+                    await self.wallet_state_manager.blockchain.new_valid_weight_proof(weight_proof, block_records)
+                    self._weight_proof_sources.clear()
+                    self._weight_proof_sources[peak.header_hash] = candidate.peer_node_id
+                    self.log.info("Validated weight proof at height %s from %s", peak.height, candidate.peer_info)
+                    return get_wp_fork_point(self.constants, old_proof, weight_proof)
+                discover_candidates()
+                if candidates and len(tasks) < 3:
+                    start_next()
+            raise last_error
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._weight_proof_syncing = False
 
     async def get_puzzle_hashes_to_subscribe(self) -> List[bytes32]:
         all_puzzle_hashes = await self.wallet_state_manager.puzzle_store.get_all_puzzle_hashes(1)

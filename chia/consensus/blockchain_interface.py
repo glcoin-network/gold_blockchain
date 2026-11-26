@@ -112,3 +112,19 @@ class BlockchainInterface:
         additional_blocks: Optional[Dict[bytes32, FullBlock]] = None,
     ) -> Decimal:
         raise NotImplementedError("get_farmer_difficulty_coeff not implemented")
+
+    async def get_farmer_difficulty_coeffs(self, headers: List[HeaderBlock]) -> List[Decimal]:
+        """Return coefficients for a contiguous set of headers.
+
+        Implementations with a database can override this to reuse the
+        rolling farmer-history window. The fallback preserves the old
+        per-header behavior for lightweight blockchain views used in tests.
+        """
+        return [
+            await self.get_farmer_difficulty_coeff(
+                header.reward_chain_block.proof_of_space.farmer_public_key,
+                uint32(max(0, int(header.height) - 1)),
+                parent_hash=header.prev_header_hash,
+            )
+            for header in headers
+        ]

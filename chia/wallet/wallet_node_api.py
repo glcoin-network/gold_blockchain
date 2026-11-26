@@ -67,6 +67,9 @@ class WalletNodeAPI:
                 for untrusted_peer in untrusted_peers:
                     await untrusted_peer.close()
 
+        if not self.wallet_node.is_trusted(peer):
+            # The queue can be busy waiting for a proof from another peer.
+            self.wallet_node._record_untrusted_peak(peak, peer)
         await self.wallet_node.new_peak_queue.new_peak_wallet(peak, peer)
 
     @api_request()

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import ipaddress
 import logging
+import socket
 import time
 import traceback
 from collections import defaultdict
@@ -72,6 +73,7 @@ class Crawler:
     version_cache: List[Tuple[str, str]] = field(default_factory=list)
     handshake_time: Dict[str, uint64] = field(default_factory=dict)
     best_timestamp_per_peer: Dict[str, uint64] = field(default_factory=dict)
+    _bootstrap_refresh_at: float = 0
 
     @property
     def server(self) -> GoldServer:
@@ -92,6 +94,10 @@ class Crawler:
         self.crawl_store: CrawlStore = await CrawlStore.create(await aiosqlite.connect(self.db_path))
         # Bootstrap the initial peers
         await self.load_bootstrap_peers()
+        self.host_to_version, self.handshake_time = self.crawl_store.load_host_to_version()
+        self.best_timestamp_per_peer = self.crawl_store.load_best_peer_reliability()
+        for version in self.host_to_version.values():
+            self.versions[version] += 1
         self.crawl_task = asyncio.create_task(self.crawl())
         try:
             yield
@@ -177,35 +183,49 @@ class Crawler:
 
     async def load_bootstrap_peers(self) -> None:
         assert self.crawl_store is not None
-        try:
+        initial = self._bootstrap_refresh_at == 0
+        if initial:
             self.log.warning("Bootstrapping initial peers...")
-            t_start = time.time()
-            for peer in self.bootstrap_peers:
-                new_peer = PeerRecord(
-                    peer,
-                    peer,
-                    self.other_peers_port,
-                    False,
-                    uint64(0),
-                    uint32(0),
-                    uint64(0),
-                    uint64(int(time.time())),
-                    uint64(0),
-                    "undefined",
-                    uint64(0),
-                    tls_version="unknown",
-                )
-                new_peer_reliability = PeerReliability(peer)
-                self.crawl_store.maybe_add_peer(new_peer, new_peer_reliability)
+        added = 0
+        for host in self.bootstrap_peers:
+            try:
+                try:
+                    addresses = {str(ipaddress.ip_address(host))}
+                except ValueError:
+                    rows = await asyncio.wait_for(
+                        asyncio.get_running_loop().getaddrinfo(host, self.other_peers_port, type=socket.SOCK_STREAM),
+                        timeout=10,
+                    )
+                    addresses = {
+                        str(ipaddress.ip_address(row[4][0]))
+                        for row in rows
+                        if row[0] in (socket.AF_INET, socket.AF_INET6)
+                    }
+                for address in sorted(addresses):
+                    if address in self.crawl_store.host_to_records:
+                        continue
+                    new_peer = PeerRecord(
+                        address,
+                        address,
+                        self.other_peers_port,
+                        False,
+                        uint64(0),
+                        uint32(0),
+                        uint64(0),
+                        uint64(int(time.time())),
+                        uint64(0),
+                        "undefined",
+                        uint64(0),
+                        tls_version="unknown",
+                    )
+                    self.crawl_store.maybe_add_peer(new_peer, PeerReliability(address))
+                    added += 1
+            except Exception as e:
+                self.log.warning(f"Unable to resolve bootstrap peer {host}: {type(e).__name__}: {e}")
 
-            self.host_to_version, self.handshake_time = self.crawl_store.load_host_to_version()
-            self.best_timestamp_per_peer = self.crawl_store.load_best_peer_reliability()
-            for host, version in self.host_to_version.items():
-                self.versions[version] += 1
-
-            self.log.warning(f"Bootstrapped initial peers in {time.time() - t_start} seconds")
-        except Exception as e:
-            self.log.error(f"Error bootstrapping initial peers: {e}")
+        self._bootstrap_refresh_at = time.monotonic() + 300
+        if initial or added:
+            self.log.warning(f"Bootstrap DNS refresh added {added} IP addresses.")
 
     async def crawl(self) -> None:
         # Ensure the state_changed callback is set up before moving on
@@ -220,7 +240,16 @@ class Crawler:
         tried_nodes = set()
         try:
             while not self._shut_down:
-                peers_to_crawl = await self.crawl_store.get_peers_to_crawl(25000, 250000)
+                if time.monotonic() >= self._bootstrap_refresh_at:
+                    await self.load_bootstrap_peers()
+                peers_to_crawl = []
+                for candidate in await self.crawl_store.get_peers_to_crawl(25000, 250000):
+                    try:
+                        ipaddress.ip_address(candidate.ip_address)
+                    except ValueError:
+                        # Older databases may retain hostname records; probe their resolved IPs instead.
+                        continue
+                    peers_to_crawl.append(candidate)
                 tasks = set()
                 for peer in peers_to_crawl:
                     if peer.port == self.other_peers_port:
@@ -301,11 +330,10 @@ class Crawler:
                 self.server.banned_peers = {}
                 self.with_peak = set()
 
-                if len(peers_to_crawl) == 0:
-                    continue
-
-                await self.save_to_db()
-                await self.print_summary(t_start, total_nodes, tried_nodes)
+                if len(peers_to_crawl) > 0:
+                    await self.save_to_db()
+                    await self.print_summary(t_start, total_nodes, tried_nodes)
+                # Empty batches must also yield so RPC and daemon heartbeats can run.
                 await asyncio.sleep(15)  # 15 seconds between db updates
                 self._state_changed("crawl_batch_completed")
         except Exception as e:

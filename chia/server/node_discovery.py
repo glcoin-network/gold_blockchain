@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import math
 import random
+import socket
 import time
 import traceback
 from logging import Logger
@@ -29,6 +30,8 @@ from chia.util.network import IPAddress, resolve
 MAX_PEERS_RECEIVED_PER_REQUEST = 1000
 MAX_TOTAL_PEERS_RECEIVED = 3000
 MAX_CONCURRENT_OUTBOUND_CONNECTIONS = 70
+BOOTSTRAP_CONCURRENCY = 3
+BOOTSTRAP_PEERS_PER_SOURCE = 8
 NETWORK_ID_DEFAULT_PORTS = {
     "mainnet": 14444,
     "testnet0": 54444,
@@ -56,8 +59,8 @@ class FullNodeDiscovery:
         self.target_outbound_count = target_outbound_count
         self.legacy_peer_db_migrated = False
         self.peers_file_path = peers_file_path
-        self.dns_servers = dns_servers
-        random.shuffle(dns_servers)  # Don't always start with the same DNS server
+        self.dns_servers = list(dns_servers)
+        random.shuffle(self.dns_servers)  # Don't always start with the same DNS server
         self.introducer_info: Optional[UnresolvedPeerInfo] = None
         if introducer_info is not None:
             self.introducer_info = UnresolvedPeerInfo(introducer_info["host"], introducer_info["port"])
@@ -74,6 +77,14 @@ class FullNodeDiscovery:
         self.connect_peers_task: Optional[asyncio.Task[None]] = None
         self.serialize_task: Optional[asyncio.Task[None]] = None
         self.cleanup_task: Optional[asyncio.Task[None]] = None
+        self.bootstrap_task: Optional[asyncio.Task[None]] = None
+        self.bootstrap_enabled = (
+            selected_network == "mainnet"
+            and server._local_type == NodeType.FULL_NODE
+            and default_port in (None, 14444)
+            and not self.enable_private_networks
+            and (self.introducer_info is not None or bool(self.dns_servers))
+        )
         self.initial_wait: int = 0
         try:
             self.resolver: Optional[dns.asyncresolver.Resolver] = dns.asyncresolver.Resolver()
@@ -97,12 +108,76 @@ class FullNodeDiscovery:
         self.connect_peers_task = asyncio.create_task(self._connect_to_peers(random))
         self.serialize_task = asyncio.create_task(self._periodically_serialize(random))
         self.cleanup_task = asyncio.create_task(self._periodically_cleanup())
+        self.bootstrap_task = asyncio.create_task(self._bootstrap_when_disconnected())
+
+    async def _bootstrap_when_disconnected(self) -> None:
+        # Refresh even a populated address book when outbound connections are missing.
+        while not self.is_closed and self.bootstrap_enabled:
+            try:
+                if self._num_needed_peers() > 0:
+                    sources = set()
+                    if self.default_port is not None:
+                        sources.update((host, self.default_port) for host in self.dns_servers)
+                    if self.introducer_info is not None:
+                        sources.add((self.introducer_info.host, self.introducer_info.port))
+                    semaphore = asyncio.Semaphore(BOOTSTRAP_CONCURRENCY)
+                    attempted_peers: Set[PeerInfo] = set()
+                    # Resolve sources independently: a failed seeder must not block the others.
+                    await asyncio.gather(
+                        *(
+                            self._bootstrap_from_host(host, port, semaphore, attempted_peers)
+                            for host, port in sorted(sources)
+                        )
+                    )
+            except Exception:
+                self.log.exception("Mainnet bootstrap attempt failed; will retry")
+            await asyncio.sleep(60)
+
+    async def _bootstrap_from_host(
+        self, host: str, port: int, semaphore: asyncio.Semaphore, attempted_peers: Set[PeerInfo]
+    ) -> None:
+        try:
+            records = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
+                timeout=10,
+            )
+            peers = list({PeerInfo(record[4][0], port) for record in records})
+            random.shuffle(peers)
+            peers = peers[:BOOTSTRAP_PEERS_PER_SOURCE]
+            # Try IPv4 first without excluding nodes on IPv6-only networks.
+            peers.sort(key=lambda peer: peer.ip.is_v6)
+            for addr in peers:
+                async with semaphore:
+                    if self.is_closed or self._num_needed_peers() == 0:
+                        return
+                    if (
+                        addr in attempted_peers
+                        or addr.host in self.pending_outbound_connections
+                        or len(self.pending_outbound_connections) >= MAX_CONCURRENT_OUTBOUND_CONNECTIONS
+                        or self.server.is_duplicate_or_self_connection(addr)
+                        or (addr.ip.is_private and not self.enable_private_networks)
+                    ):
+                        continue
+                    attempted_peers.add(addr)
+                    await self._add_peers_common(
+                        [TimestampedPeerInfo(addr.host, uint16(port), uint64(0))], None, False
+                    )
+                    self.log.info(f"Trying peer resolved from {host}: {addr.host}:{port}")
+                    try:
+                        await asyncio.wait_for(self.start_client_async(addr, False), timeout=40)
+                    except asyncio.TimeoutError:
+                        self.log.warning("Bootstrap connection to %s:%s timed out", addr.host, port)
+        except Exception:
+            self.log.warning("Bootstrap source %s:%s failed; will retry", host, port, exc_info=True)
 
     async def _close_common(self) -> None:
         self.is_closed = True
         self.cancel_task_safe(self.connect_peers_task)
         self.cancel_task_safe(self.serialize_task)
         self.cancel_task_safe(self.cleanup_task)
+        self.cancel_task_safe(self.bootstrap_task)
+        if self.bootstrap_task is not None:
+            await asyncio.gather(self.bootstrap_task, return_exceptions=True)
         for t in self.pending_tasks:
             self.cancel_task_safe(t)
         if len(self.pending_tasks) > 0:
@@ -189,18 +264,16 @@ class FullNodeDiscovery:
         )
 
     async def _query_dns(self, dns_address: str) -> None:
-        try:
-            if self.default_port is None:
-                self.log.error(
-                    "Network id not supported in NETWORK_ID_DEFAULT_PORTS neither in config. Skipping DNS query."
-                )
-                return
-            if self.resolver is None:
-                self.log.warning("Skipping DNS query: asyncresolver not initialized.")
-                return
-            for rdtype in ["A", "AAAA"]:
+        if self.default_port is None:
+            self.log.error("Network id not supported in NETWORK_ID_DEFAULT_PORTS neither in config. Skipping DNS query.")
+            return
+        if self.resolver is None:
+            self.log.warning("Skipping DNS query: asyncresolver not initialized.")
+            return
+        for rdtype in ["A", "AAAA"]:
+            try:
                 peers: List[TimestampedPeerInfo] = []
-                result = await self.resolver.resolve(qname=dns_address, rdtype=rdtype, lifetime=30)
+                result = await self.resolver.resolve(qname=dns_address, rdtype=rdtype, lifetime=5)
                 for ip in result:
                     peers.append(
                         TimestampedPeerInfo(
@@ -212,8 +285,8 @@ class FullNodeDiscovery:
                 self.log.info(f"Received {len(peers)} peers from DNS seeder, using rdtype = {rdtype}.")
                 if len(peers) > 0:
                     await self._add_peers_common(peers, None, False)
-        except Exception as e:
-            self.log.warning(f"querying DNS introducer failed: {e}")
+            except Exception as e:
+                self.log.warning(f"querying DNS introducer {dns_address} {rdtype} failed: {e}")
 
     async def on_connect_callback(self, peer: WSGoldConnection) -> None:
         if self.server.on_connect is not None:
@@ -222,9 +295,14 @@ class FullNodeDiscovery:
             await self.on_connect(peer)
 
     async def start_client_async(self, addr: PeerInfo, is_feeler: bool) -> None:
+        if (
+            self.is_closed
+            or self.address_manager is None
+            or addr.host in self.pending_outbound_connections
+            or len(self.pending_outbound_connections) >= MAX_CONCURRENT_OUTBOUND_CONNECTIONS
+        ):
+            return
         try:
-            if self.address_manager is None:
-                return
             self.pending_outbound_connections.add(addr.host)
             client_connected = await self.server.start_client(
                 addr,
@@ -246,6 +324,8 @@ class FullNodeDiscovery:
                 self.pending_outbound_connections.remove(addr.host)
             self.log.error(f"Exception in create outbound connections: {e}")
             self.log.error(f"Traceback: {traceback.format_exc()}")
+        finally:
+            self.pending_outbound_connections.discard(addr.host)
 
     async def _connect_to_peers(self, random: Random) -> None:
         next_feeler = self._poisson_next_send(time.time() * 1000 * 1000, 240, random)

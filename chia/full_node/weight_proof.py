@@ -6,6 +6,7 @@ import math
 import pathlib
 import random
 import tempfile
+import time
 from concurrent.futures.process import ProcessPoolExecutor
 from decimal import Decimal
 from multiprocessing.context import BaseContext
@@ -73,6 +74,7 @@ class WeightProofHandler:
         self.multiprocessing_context = multiprocessing_context
 
     async def get_proof_of_weight(self, tip: bytes32) -> Optional[WeightProof]:
+        request_started = time.monotonic()
         tip_rec = self.blockchain.try_block_record(tip)
         if tip_rec is None:
             log.error("unknown tip")
@@ -82,15 +84,46 @@ class WeightProofHandler:
             log.debug("chain to short for weight proof")
             return None
 
+        lock_started = time.monotonic()
         async with self.lock:
+            log.info(
+                "weight proof builder lock acquired: height=%s wait=%.3fs",
+                tip_rec.height, time.monotonic() - lock_started,
+            )
             if self.proof is not None:
                 if self.proof.recent_chain_data[-1].header_hash == tip:
+                    log.info(
+                        "weight proof cache hit: height=%s elapsed=%.3fs",
+                        tip_rec.height, time.monotonic() - request_started,
+                    )
                     return self.proof
-            wp = await self._create_proof_of_weight(tip)
+            try:
+                wp = await self._create_proof_of_weight(tip)
+            except asyncio.CancelledError:
+                log.warning(
+                    "weight proof build cancelled: height=%s elapsed=%.3fs",
+                    tip_rec.height, time.monotonic() - request_started,
+                )
+                raise
+            except Exception:
+                log.exception(
+                    "weight proof build failed: height=%s elapsed=%.3fs",
+                    tip_rec.height, time.monotonic() - request_started,
+                )
+                raise
             if wp is None:
+                log.warning(
+                    "weight proof build returned no proof: height=%s elapsed=%.3fs",
+                    tip_rec.height, time.monotonic() - request_started,
+                )
                 return None
             self.proof = wp
             self.tip = tip
+            log.info(
+                "weight proof build complete: height=%s sub_epochs=%s recent_headers=%s elapsed=%.3fs",
+                tip_rec.height, len(wp.sub_epochs), len(wp.recent_chain_data),
+                time.monotonic() - request_started,
+            )
             return wp
 
     def get_sub_epoch_data(self, tip_height: uint32, summary_heights: List[uint32]) -> List[SubEpochData]:
@@ -107,6 +140,7 @@ class WeightProofHandler:
         """
         Creates a weight proof object
         """
+        build_started = time.monotonic()
         assert self.blockchain is not None
         sub_epoch_segments: List[SubEpochChallengeSegment] = []
         tip_rec = self.blockchain.try_block_record(tip)
@@ -114,7 +148,14 @@ class WeightProofHandler:
             log.error("failed not tip in cache")
             return None
         log.info(f"create weight proof peak {tip} {tip_rec.height}")
+        recent_started = time.monotonic()
         recent_chain, difficulty_coeffs = await self._get_recent_chain(tip_rec.height)
+        log.info(
+            "weight proof recent chain ready: height=%s headers=%s coefficients=%s elapsed=%.3fs",
+            tip_rec.height, 0 if recent_chain is None else len(recent_chain),
+            0 if difficulty_coeffs is None else len(difficulty_coeffs),
+            time.monotonic() - recent_started,
+        )
         if recent_chain is None:
             return None
 
@@ -134,6 +175,8 @@ class WeightProofHandler:
         if ses_blocks is None:
             return None
 
+        segment_started = time.monotonic()
+        sampled_epochs = 0
         for sub_epoch_n, ses_height in enumerate(summary_heights):
             if ses_height > tip_rec.height:
                 break
@@ -151,6 +194,8 @@ class WeightProofHandler:
 
             if _sample_sub_epoch(prev_ses_block.weight, ses_block.weight, weight_to_check):
                 sample_n += 1
+                sampled_epochs += 1
+                sample_started = time.monotonic()
                 segments = await self.blockchain.get_sub_epoch_challenge_segments(ses_block.header_hash)
                 if segments is None:
                     segments = await self.__create_sub_epoch_segments(ses_block, prev_ses_block, uint32(sub_epoch_n))
@@ -161,8 +206,17 @@ class WeightProofHandler:
                         return None
                     await self.blockchain.persist_sub_epoch_challenge_segments(ses_block.header_hash, segments)
                 sub_epoch_segments.extend(segments)
+                log.debug(
+                    "weight proof segment ready: sub_epoch=%s segments=%s elapsed=%.3fs",
+                    sub_epoch_n, len(segments), time.monotonic() - sample_started,
+                )
             prev_ses_block = ses_block
+        log.info(
+            "weight proof segments ready: height=%s sampled_epochs=%s segments=%s elapsed=%.3fs",
+            tip_rec.height, sampled_epochs, len(sub_epoch_segments), time.monotonic() - segment_started,
+        )
         log.debug(f"sub_epochs: {len(sub_epoch_data)}")
+        log.debug("weight proof assembly complete in %.3fs", time.monotonic() - build_started)
         return WeightProof(sub_epoch_data, sub_epoch_segments, recent_chain, difficulty_coeffs)
 
     def get_seed_for_proof(self, summary_heights: List[uint32], tip_height: uint32) -> bytes32:
@@ -180,7 +234,6 @@ class WeightProofHandler:
 
     async def _get_recent_chain(self, tip_height: uint32) -> Tuple[Optional[List[HeaderBlock]], Optional[List[str]]]:
         recent_chain: List[HeaderBlock] = []
-        difficulty_coeffs: List[str] = []
         ses_heights = self.blockchain.get_ses_heights()
         min_height = 0
         count_ses = 0
@@ -208,11 +261,6 @@ class WeightProofHandler:
                 log.error("creating recent chain failed")
                 return None
             recent_chain.insert(0, header_block)
-            difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
-                header_block.reward_chain_block.proof_of_space.farmer_public_key, curr_height - 1,
-                parent_hash=header_block.prev_header_hash,
-            )
-            difficulty_coeffs.insert(0, str(difficulty_coeff))
             if block_rec.sub_epoch_summary_included:
                 ses_count += 1
             curr_height = uint32(curr_height - 1)
@@ -222,18 +270,15 @@ class WeightProofHandler:
         assert header_hash is not None
         header_block = headers[header_hash]
         recent_chain.insert(0, header_block)
-        difficulty_coeff = await self.blockchain.get_farmer_difficulty_coeff(
-            header_block.reward_chain_block.proof_of_space.farmer_public_key,
-            curr_height - 1 if curr_height > 0 else 0,
-            parent_hash=header_block.prev_header_hash,
-        )
-        difficulty_coeffs.insert(0, str(difficulty_coeff))
-
         log.info(
             f"recent chain, "
             f"start: {recent_chain[0].reward_chain_block.height} "
             f"end:  {recent_chain[-1].reward_chain_block.height} "
         )
+        difficulty_coeffs = [
+            str(coefficient)
+            for coefficient in await self.blockchain.get_farmer_difficulty_coeffs(recent_chain)
+        ]
         return recent_chain, difficulty_coeffs
 
     async def create_prev_sub_epoch_segments(self) -> None:
@@ -895,7 +940,8 @@ def _map_sub_epoch_summaries(
             delta = 0
             if idx > 0:
                 delta = sub_epoch_data[idx].num_blocks_overflow
-            log.debug(f"sub epoch {idx} start weight is {total_weight+curr_difficulty} ")
+            if idx % 1024 == 0:
+                log.debug("sub epoch %s start weight is %s", idx, total_weight + curr_difficulty)
             sub_epoch_weight_list.append(uint128(total_weight + curr_difficulty))
             total_weight = uint128(
                 total_weight
@@ -1677,6 +1723,7 @@ async def validate_weight_proof_inner(
     skip_segment_validation: bool,
     validate_from: int,
 ) -> Tuple[bool, List[BlockRecord]]:
+    validation_started = time.monotonic()
     assert len(weight_proof.sub_epochs) > 0
     if len(weight_proof.sub_epochs) == 0:
         return False, []
@@ -1690,7 +1737,14 @@ async def validate_weight_proof_inner(
         return False, []
 
     loop = asyncio.get_running_loop()
+    serialization_started = time.monotonic()
     summary_bytes, wp_segment_bytes, wp_recent_chain_bytes = vars_to_bytes(summaries, weight_proof)
+    log.info(
+        "weight proof validation payload serialized: summaries=%s segment_bytes=%s recent_chain_bytes=%s elapsed=%.3fs",
+        len(summary_bytes), len(wp_segment_bytes), len(wp_recent_chain_bytes),
+        time.monotonic() - serialization_started,
+    )
+    recent_validation_started = time.monotonic()
     recent_blocks_validation_task = loop.run_in_executor(
         executor,
         validate_recent_blocks,
@@ -1702,14 +1756,19 @@ async def validate_weight_proof_inner(
     )
 
     if not skip_segment_validation:
-        vdfs_to_validate = _validate_sub_epoch_segments(
-            constants, rng, wp_segment_bytes, summary_bytes, peak_height, validate_from
+        segment_validation_started = time.monotonic()
+        vdfs_to_validate = await loop.run_in_executor(
+            None, _validate_sub_epoch_segments,
+            constants, rng, wp_segment_bytes, summary_bytes, peak_height, validate_from,
         )
-        await asyncio.sleep(0)  # break up otherwise multi-second sync code
 
         if vdfs_to_validate is None:
             return False, []
 
+        log.info(
+            "weight proof segment structure validated: vdfs=%s elapsed=%.3fs",
+            len(vdfs_to_validate), time.monotonic() - segment_validation_started,
+        )
         vdf_tasks = []
         for batch in to_batches(vdfs_to_validate, num_processes):
             byte_chunks = []
@@ -1726,12 +1785,21 @@ async def validate_weight_proof_inner(
             # give other stuff a turn
             await asyncio.sleep(0)
 
+        vdf_started = time.monotonic()
         for vdf_task in asyncio.as_completed(fs=vdf_tasks):
             validated = await vdf_task
             if not validated:
                 return False, []
+        log.info(
+            "weight proof VDF validation complete: batches=%s elapsed=%.3fs",
+            len(vdf_tasks), time.monotonic() - vdf_started,
+        )
 
     valid_recent_blocks, records_bytes = await recent_blocks_validation_task
+    log.info(
+        "weight proof recent blocks validation complete: valid=%s elapsed=%.3fs",
+        valid_recent_blocks, time.monotonic() - recent_validation_started,
+    )
     # valid_recent_blocks, records_bytes = validate_recent_blocks(
     #     constants,
     #     wp_recent_chain_bytes,
@@ -1746,4 +1814,5 @@ async def validate_weight_proof_inner(
         return False, []
 
     records = [BlockRecord.from_bytes(b) for b in records_bytes]
+    log.debug("weight proof validation stages complete in %.3fs", time.monotonic() - validation_started)
     return True, records

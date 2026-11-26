@@ -265,8 +265,10 @@ async def get_dns_reply(callback: DnsCallback, dns_request: DNSRecord) -> DNSRec
 class DNSServer:
     config: Dict[str, Any]
     root_path: Path
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    shutdown_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Create these primitives inside the event loop that runs the DNS server.
+    # Python 3.8 can otherwise bind them to a loop replaced by asyncio.run().
+    lock: asyncio.Lock = field(init=False)
+    shutdown_event: asyncio.Event = field(init=False)
     crawl_store: Optional[CrawlStore] = field(init=False, default=None)
     reliable_task: Optional[asyncio.Task[None]] = field(init=False, default=None)
     shutting_down: bool = field(init=False, default=False)
@@ -326,36 +328,36 @@ class DNSServer:
         log.warning("Starting DNS server.")
         # Get a reference to the event loop as we plan to use low-level APIs.
         loop = asyncio.get_running_loop()
+        self.lock = asyncio.Lock()
+        self.shutdown_event = asyncio.Event()
 
-        # Set up the crawl store and the peer update task.
-        self.crawl_store = await CrawlStore.create(await aiosqlite.connect(self.db_path, timeout=120))
-        self.reliable_task = asyncio.create_task(self.periodically_get_reliable_peers())
-
-        # One protocol instance will be created for each udp transport, so that we can accept ipv4 and ipv6
-        self.udp_transport_ipv6, self.udp_protocol_ipv6 = await loop.create_datagram_endpoint(
-            lambda: UDPDNSServerProtocol(self.dns_response), local_addr=("::0", self.udp_dns_port)
-        )
-        self.udp_protocol_ipv6.start()  # start ipv6 udp transmit task
-
-        # in case the port is 0, we get the real port
-        self.udp_dns_port = self.udp_transport_ipv6.get_extra_info("sockname")[1]  # get the port we bound to
-
-        if sys.platform.startswith("win32") or sys.platform.startswith("cygwin"):
-            # Windows does not support dual stack sockets, so we need to create a new socket for ipv4.
-            self.udp_transport_ipv4, self.udp_protocol_ipv4 = await loop.create_datagram_endpoint(
-                lambda: UDPDNSServerProtocol(self.dns_response), local_addr=("0.0.0.0", self.udp_dns_port)
-            )
-            self.udp_protocol_ipv4.start()  # start ipv4 udp transmit task
-
-        # One tcp server will handle both ipv4 and ipv6 on both linux and windows.
-        self.tcp_server = await loop.create_server(
-            lambda: TCPDNSServerProtocol(self.dns_response), ["::0", "0.0.0.0"], self.tcp_dns_port
-        )
-
-        log.warning("DNS server started.")
         try:
+            # Include startup in cleanup: binding can fail after the DB thread starts.
+            self.crawl_store = await CrawlStore.create(await aiosqlite.connect(self.db_path, timeout=120))
+            self.reliable_task = asyncio.create_task(self.periodically_get_reliable_peers())
+
+            # One protocol instance will be created for each udp transport.
+            self.udp_transport_ipv6, self.udp_protocol_ipv6 = await loop.create_datagram_endpoint(
+                lambda: UDPDNSServerProtocol(self.dns_response), local_addr=("::0", self.udp_dns_port)
+            )
+            self.udp_protocol_ipv6.start()
+
+            # In case the port is 0, get the real port we bound to.
+            self.udp_dns_port = self.udp_transport_ipv6.get_extra_info("sockname")[1]
+
+            if sys.platform.startswith("win32") or sys.platform.startswith("cygwin"):
+                # Windows needs a separate IPv4 UDP socket.
+                self.udp_transport_ipv4, self.udp_protocol_ipv4 = await loop.create_datagram_endpoint(
+                    lambda: UDPDNSServerProtocol(self.dns_response), local_addr=("0.0.0.0", self.udp_dns_port)
+                )
+                self.udp_protocol_ipv4.start()
+
+            self.tcp_server = await loop.create_server(
+                lambda: TCPDNSServerProtocol(self.dns_response), ["::0", "0.0.0.0"], self.tcp_dns_port
+            )
+            log.warning("DNS server started.")
             yield
-        finally:  # catches any errors and properly shuts down the server
+        finally:
             await self.stop()
             log.warning("DNS server stopped.")
 
